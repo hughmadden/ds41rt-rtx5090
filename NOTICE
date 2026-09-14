@@ -1,0 +1,13 @@
+This repository contains scripts and documentation for deploying DS41RT
+(https://github.com/tpurtell/ds41rt, MIT licence, copyright its authors) with the
+coordinator on an RTX 5090. It vendors no DS41RT source. Where the scripts mirror
+the invocation shapes of DS41RT's own run.sh and build.sh, that is deliberate so
+the launches stay comparable with upstream's; the credit for those shapes is
+upstream's.
+
+DeepSeek-V4.1-Flash is DeepSeek's checkpoint, under its own licence. No weights or
+images are distributed here.
+
+The measured comparison in the accompanying report references the TP4 DGX-Spark vLLM
+deployment published by tonyd2wild (https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark)
+and the standard benchmark of Local Inference Labs.
