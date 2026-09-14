@@ -14,7 +14,7 @@ set -euo pipefail
 IMAGE=${IMAGE:-ghcr.io/tpurtell/ds41rt-spark-expert:v1}
 MODEL_DIR=${MODEL_DIR:-/models/DeepSeek-V4.1-Flash}
 NATIVE_LIB=${NATIVE_LIB:-/opt/ds41rt/lib/libds41rt_native.so}
-CAPACITY=${CAPACITY:-256}          # matches coordinator --prefill-batch-tokens 80
+CAPACITY=${CAPACITY:-1024}         # MUST equal the coordinator's rounded capacity (BATCH 1024 -> 1024, BATCH 80 -> 256); a mismatch fails loudly
 BUDGET=${BUDGET:-107374182400}     # SPARK_DEVICE_BUDGET_BYTES = 100 GiB
 PORT=${PORT:-19441}
 FINGERPRINT=${FINGERPRINT:-unknown}

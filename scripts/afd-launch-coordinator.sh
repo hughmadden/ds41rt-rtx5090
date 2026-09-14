@@ -3,9 +3,10 @@
 # Spark expert ranks. DRY-RUN BY DEFAULT: prints the exact command and checks preconditions;
 # only --apply starts the container.
 #
-# Verified operating point (docs/GATES.md):
-#   capacity 256 (--prefill-batch-tokens 80), dSpark, C1, prefix-cache 0,
-#   --memory-reservation 97%  ->  7.79M-token pool, ~3.0 GiB device free, READY in ~4 s.
+# Verified operating points (docs/GATES.md):
+#   capacity 1024 (--prefill-batch-tokens 1024), dSpark, C16, prefix-cache 24,
+#   --memory-reservation 97%  ->  2.5M-token pool, ~2.9 GiB device free   (default)
+#   capacity 256  (--prefill-batch-tokens 80),   same otherwise -> 7.79M-token pool (BATCH=80)
 #
 # The vendor run.sh is not used: it hard-codes the reference's hosts/addresses/HF layout.
 set -euo pipefail
@@ -14,7 +15,10 @@ IMAGE=${IMAGE:-ds41rt-coordinator-rtx5090:v1}
 NATIVE_LIB=${NATIVE_LIB:-/opt/ds41rt/lib/libds41rt_native.so}
 PEERS=${PEERS:?set PEERS to the four expert ranks in rank order, e.g. <ip0>:19441,<ip1>:19441,<ip2>:19441,<ip3>:19441}
 PORT=${PORT:-8000}
-BATCH=${BATCH:-80}
+# Default 1024 (2026-09-14): the prefill-first operating point -- prefill 5,377 tok/s at
+# 170k prompt tokens vs 2,000 at capacity 256 (2.69x), decode unchanged, pool 2.07 GiB
+# (~2.5M tokens). BATCH=80 selects capacity 256, the pool-first point (7.79M tokens).
+BATCH=${BATCH:-1024}
 # Production candidate (2026-09-14): concurrency 16 (the measured admission
 # cap; C16 boots at +6 MB occupancy, 16/16 at 131k and 8/8 at 1M all pass),
 # prefix retention 24 (byte-identical memory plan, 496x exact-reuse).

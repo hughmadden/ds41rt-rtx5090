@@ -53,7 +53,7 @@ MODEL_DIR=/path/to/DeepSeek-V4.1-Flash scripts/afd-ready-probe.sh   # READY in ~
 # 3. on each Spark, the expert rank (dry-run first, then --apply), worker-first 3,2,1,0
 FABRIC_IP=<spark fabric ip> RDMA_DEVICE=<e.g. rocep1s0f1> scripts/afd-launch-experts.sh <rank> --apply
 
-# 4. the coordinator
+# 4. the coordinator (capacity 1024 default; BATCH=80 + CAPACITY=256 on the ranks = pool-first point)
 PEERS=<ip0>:19441,<ip1>:19441,<ip2>:19441,<ip3>:19441 \
 DEVICE_MAP=<coordinator fabric ip>=<coordinator rdma device> \
 MODEL_DIR=/path/to/DeepSeek-V4.1-Flash scripts/afd-launch-coordinator.sh --apply
@@ -78,6 +78,10 @@ is at [hughmadden/ds41rt, branch `sm-count-diagnostic`](https://github.com/hughm
 
 - Measured on one fleet, on 2026-09-14 (Sydney), single runs per cell. See the report for the
   numbers and their caveats.
+- Two operating points, one flag pair: prefill capacity 1024 (default; prefill 5,377 tok/s at
+  170k prompt tokens, 2.5M-token KV pool) or capacity 256 (`BATCH=80` and `CAPACITY=256`;
+  prefill 2,000 tok/s, 7.79M-token pool). Decode is the same at both (74 vs 73.5 tok/s).
+  The widening was suggested by DS41RT's author and measured the same day.
 - The like-for-like baseline (the same four Sparks running the reference TP4 vLLM deployment,
   same prompts, same bench) has not been run yet. The report says so where it matters.
 - The Engram dedicated-tier script is optional and was **not** needed for the measured results:

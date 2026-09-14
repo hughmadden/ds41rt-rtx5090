@@ -16,10 +16,13 @@ read -r -a IPS <<<"${RANK_IPS:?set RANK_IPS (four fabric addresses, rank order)}
 rank_ip() { echo "${IPS[$1]}"; }
 rank_host() { echo "${HOSTS[$1]}"; }
 export RDMA_DEVICE
+# Capacity must agree on every rank and the coordinator. Default 1024; set CAPACITY=256
+# together with BATCH=80 for the pool-first point.
+CAPACITY=${CAPACITY:-1024}; BATCH=${BATCH:-1024}; export CAPACITY BATCH
 for r in 3 2 1 0; do
   echo "== rank $r on $(rank_host $r) ($(rank_ip $r))"
   if [[ $apply -eq 1 ]]; then
-    ssh -o BatchMode=yes "$(rank_host $r)" "FABRIC_IP=$(rank_ip $r) RDMA_DEVICE=$RDMA_DEVICE bash -s -- $r --apply" \
+    ssh -o BatchMode=yes "$(rank_host $r)" "FABRIC_IP=$(rank_ip $r) RDMA_DEVICE=$RDMA_DEVICE CAPACITY=$CAPACITY bash -s -- $r --apply" \
       < "$SCRIPT_DIR/afd-launch-experts.sh" | tail -1
   else
     FABRIC_IP="$(rank_ip $r)" bash "$SCRIPT_DIR/afd-launch-experts.sh" "$r" | tail -2

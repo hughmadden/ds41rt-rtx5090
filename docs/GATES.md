@@ -65,10 +65,14 @@ Readings that matter:
   on 32 GB. `--memory-reservation 97%` is mandatory.
 - **dSpark costs 7.95 GB resident.** Capacity 1024 with dSpark leaves 3.4 GiB for the pool;
   capacity 256 with dSpark leaves 7.4 GiB. Capacity 4096 never boots on this card.
-- **Chosen operating point:** capacity 256 (`--prefill-batch-tokens 80`), dSpark on,
+- **Operating points.** Capacity 256 (`--prefill-batch-tokens 80`), dSpark on,
   `--memory-reservation 97%` → **7.79M-token pool, ~3.0 GiB device free, readiness in 4 s**
-  (`scripts/afd-ready-probe.sh`; plan line `global_bytes=6934538240`; `nvidia-smi` 29,150 MiB
-  used / 3,001 MiB free).
+  (plan line `global_bytes=6934538240`; `nvidia-smi` 29,150 MiB used / 3,001 MiB free).
+  Capacity 1024 (`--prefill-batch-tokens 1024`), same otherwise → **26.35 GiB occupied
+  (28,289,794,048 B), pool auto-sized to 2.07 GiB (2,218,250,240 B, ~2.5M tokens), 2,989 MiB
+  free**; the planner sizes the pool itself at 97% without a forced `--kv-pool-size`. This is
+  the default since 2026-09-14: prefill 5,377 tok/s at 170k prompt tokens vs 2,000 at capacity
+  256, decode unchanged.
 - **Prefix retention is free.** `--prefix-cache-entries 24` produces a byte-identical memory
   plan: the retention banks live in the engine's fixed 2 GiB runtime headroom.
 - **Concurrency is nearly free in memory:** the second lane adds 6 MB; concurrency 16 boots.
