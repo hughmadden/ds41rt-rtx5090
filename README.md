@@ -10,6 +10,13 @@ we ran, with our addresses and paths taken out, so you can run it on your own ma
 Measured results (prefill, decode, 1M context, concurrency) are in the public report:
 **https://services.turquoisebay.ai/share/dsv41-afd-hybrid/**
 
+## Part 2: the host-RAM snapshot cache benchmark harness
+
+`bench/hostcache/` holds the load generators, reducers, mock server, test suite and bench plan behind the
+second report in this series, **"Same hardware, double the work: a write-back KV snapshot cache for DS41RT"**
+(https://services.turquoisebay.ai/share/ds41rt-hostcache/). The cache code is on the engine fork
+(https://github.com/hughmadden/ds41rt, branch `hostcache/rc4`). See `bench/hostcache/README.md`.
+
 ## What is in here
 
 | Path | What it is |
