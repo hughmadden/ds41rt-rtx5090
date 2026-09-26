@@ -11,7 +11,10 @@
 #         afd-launch-experts.sh <rank> [--apply]
 set -euo pipefail
 
-IMAGE=${IMAGE:-ghcr.io/tpurtell/ds41rt-spark-expert:v1}
+# The published v15 image, unmodified (manifest sha256:92e8a70d…, image ID sha256:0a6c0fae…).
+# If a GHCR pull stalls on some Sparks, copy it from one that has it:
+#   docker save $IMAGE | ssh <other spark> docker load
+IMAGE=${IMAGE:-ghcr.io/tpurtell/ds41rt-spark-expert:v15}
 MODEL_DIR=${MODEL_DIR:-/models/DeepSeek-V4.1-Flash}
 NATIVE_LIB=${NATIVE_LIB:-/opt/ds41rt/lib/libds41rt_native.so}
 CAPACITY=${CAPACITY:-1024}         # MUST equal the coordinator's rounded capacity (BATCH 1024 -> 1024, BATCH 80 -> 256); a mismatch fails loudly

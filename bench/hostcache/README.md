@@ -5,10 +5,12 @@ for DS41RT"** — https://services.turquoisebay.ai/share/ds41rt-hostcache/ — p
 numbers can be reproduced and the load models reused. Addresses and paths are taken out (the repo's
 convention); everything else is exactly what ran on our fleet on 2026-09-15.
 
-The cache itself (the `ds41rt-hostcache` crate, the engine binding and the two engine-limit patches) is on
-our fork of the engine: https://github.com/hughmadden/ds41rt (branch `hostcache/rc4` is the production
-candidate the report measures; `hostcache/rc6` adds the admission requeue and the 429 front-door queue,
-upstream issues tpurtell/ds41rt#2 and #3).
+The cache itself (the `ds41rt-hostcache` crate and the engine binding) is upstream: it was merged into
+tpurtell/ds41rt as PR #4 on 2026-09-17 and ships from DS41RT v6. The two engine-limit fixes are upstream
+too (v6): the admission requeue (issue #2, commit `5f487c14`) and the bounded front-door queue with 429 +
+`Retry-After` (issue #3, commit `7c35f3e5`). The fork these were first built on (`hostcache/rc4`, the
+production candidate the report measures; `hostcache/rc6`) is retired. One later fix to the cache's RAM
+eviction order is in this repository's `patches/0002` (see the top-level README).
 
 | File | What it is |
 |---|---|

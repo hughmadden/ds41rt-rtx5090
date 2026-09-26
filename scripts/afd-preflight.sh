@@ -9,13 +9,14 @@
 #   ./afd-preflight.sh --json     # machine-readable
 set -uo pipefail
 
-COORD_IMAGE=${COORD_IMAGE:-ds41rt-coordinator-rtx5090:v1}
-SPARK_IMAGE=${SPARK_IMAGE:-ghcr.io/tpurtell/ds41rt-spark-expert:v1}
+COORD_IMAGE=${COORD_IMAGE:-ds41rt-coordinator-rtx5090:v15}
+SPARK_IMAGE=${SPARK_IMAGE:-ghcr.io/tpurtell/ds41rt-spark-expert:v15}
 MODEL_DIR=${MODEL_DIR:?set MODEL_DIR to the DeepSeek-V4.1-Flash snapshot directory on this host}
 SPARK_MODEL_DIR=${SPARK_MODEL_DIR:-/models/DeepSeek-V4.1-Flash}
 ENGRAM_MNT=${ENGRAM_MNT:-}            # optional: mount point of a dedicated Engram device
-EXPECT_REV=${EXPECT_REV:-9ea5c96468da690fe7dd01471d4fa2fb8555a606}
-EXPECT_SPARKINFER=${EXPECT_SPARKINFER:-7299b3b92e70d539b2c0a63aaadce36932ceef4d}
+# v15 + patches/ (afd-build-coordinator.sh PATCHES=on); upstream bd06bec4 with PATCHES=none.
+EXPECT_REV=${EXPECT_REV:-27ff8c731991def9708baa232cdc0c57cfeeb2d9}
+EXPECT_SPARKINFER=${EXPECT_SPARKINFER:-7fcc094edcc93af61fdfbe14300100e3204363ea}
 EXPECT_SMS=${EXPECT_SMS:-170}
 read -r -a SPARK_HOSTS <<<"${SPARK_HOSTS:?set SPARK_HOSTS to the four expert hosts in rank order, space-separated}"
 [[ ${#SPARK_HOSTS[@]} -eq 4 ]] || { echo "SPARK_HOSTS must list exactly four hosts" >&2; exit 2; }

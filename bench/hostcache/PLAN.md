@@ -48,7 +48,7 @@ KV cache, so the pressure phases start where the arithmetic of §2 says pressure
 | Host cache quota (planned) | 24 GiB pinned ≈ **~26M tokens** (~12× device) | cutover runbook §2; design §7 (~110M tok/100 GB) |
 | Prefill / decode / 1M cold | 5,377–5,717 tok/s / 76.7 tok/s / 165.3 s | `receipts/AFD-V2-CUTOVER-20260914.md` |
 | Restore (stub model, ~25 GB/s) | 6.4 ms @100k, 69.7 ms @1M | HC-5-fix packet report (`~/dev/ds41rt-hostcache-wt/logs/hc-5-fix.out`) |
-| `/v1/stats` payload | `{"host_cache": {...counters...}}`, exported whether or not the cache is on | fork `ds41rt-api/src/native_v41.rs:77`, `ds41rt-daemon/.../scheduler.rs:103`, `ds41rt-hostcache/src/metrics.rs` |
+| `/v1/stats` payload | `{"host_cache": {...counters...}}`, exported whether or not the cache is on | engine (upstream since v6) `ds41rt-api/src/native_v41.rs:77`, `ds41rt-daemon/.../scheduler.rs:103`, `ds41rt-hostcache/src/metrics.rs` |
 
 **Two orthogonal pressure knobs** (this shapes every cell):
 

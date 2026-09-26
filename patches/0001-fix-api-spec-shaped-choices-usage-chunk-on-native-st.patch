@@ -1,0 +1,131 @@
+From 12c0f3edd43d458c32b5d98f9a7770cdfee80be7 Mon Sep 17 00:00:00 2001
+From: Turquoise Bay AI <11993289+hughmadden@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 21:47:00 +1000
+Subject: [PATCH 1/2] fix(api): spec-shaped choices:[] usage chunk on native
+ streaming with include_usage
+
+The deepseek-recipe chunk generator attaches the final usage to the finish
+chunk, which still carries choices. LiteLLM drops usage from chunks that
+carry choices, so prompt_tokens_details.cached_tokens never reached clients
+behind it: prefix-cache hits were invisible on streamed requests (non-streamed
+responses were fine).
+
+With stream_options.include_usage set, native_v41's SSE path now strips the
+usage from the finish chunk and sends it in a dedicated choices:[] chunk
+before [DONE], as the OpenAI spec and the engine's non-native streaming path
+(streaming.rs) do. Without the flag nothing changes.
+
+Test: streaming_include_usage_emits_spec_shaped_usage_chunk covers both flag
+states and carries cached_tokens through the new chunk.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ rust/crates/ds41rt-api/src/native_v41.rs | 85 ++++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/rust/crates/ds41rt-api/src/native_v41.rs b/rust/crates/ds41rt-api/src/native_v41.rs
+index 9a0a678be..bf265f38b 100644
+--- a/rust/crates/ds41rt-api/src/native_v41.rs
++++ b/rust/crates/ds41rt-api/src/native_v41.rs
+@@ -396,6 +396,32 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) ->
+                 }
+                 match chunk {
+                     Ok(chunk) => {
++                        // OpenAI spec: with stream_options.include_usage the final
++                        // usage snapshot rides a dedicated choices-empty chunk, not
++                        // the finish chunk. The recipe chunk generator attaches usage
++                        // to the finish chunk instead, which LiteLLM (and other
++                        // spec-shaped clients) silently discard — so re-shape here:
++                        // strip the usage object off the finish chunk and re-emit it
++                        // as a choices:[] chunk before [DONE]. prompt_tokens_details.
++                        // cached_tokens only reaches clients that read that chunk.
++                        if include_usage {
++                            let mut value = serde_json::to_value(&chunk).unwrap();
++                            let taken = value.get_mut("usage").map(|u| u.take());
++                            if let Some(usage) = taken.filter(|u| u.is_object()) {
++                                yield Ok(format!("data: {}\n\n", serde_json::to_string(&value).unwrap()));
++                                let usage_chunk = serde_json::json!({
++                                    "id": value["id"],
++                                    "object": value["object"],
++                                    "created": value["created"],
++                                    "model": value["model"],
++                                    "system_fingerprint": value["system_fingerprint"],
++                                    "choices": [],
++                                    "usage": usage,
++                                });
++                                yield Ok(format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap()));
++                                continue;
++                            }
++                        }
+                         yield Ok(format!("data: {}\n\n",serde_json::to_string(&chunk).unwrap()));
+                     },
+                     Err(e) => { yield Err(std::io::Error::other(e.to_string())); return; }
+@@ -635,6 +661,65 @@ mod tests {
+         }
+     }
+     #[tokio::test]
++    async fn streaming_include_usage_emits_spec_shaped_usage_chunk() {
++        // Regression: the recipe chunk generator attaches usage to the finish
++        // chunk; LiteLLM discards usage on chunks that carry choices, so
++        // prompt_tokens_details.cached_tokens never reached ds41-flash clients.
++        // With include_usage the engine must emit a final choices:[] usage chunk.
++        for include_usage in [true, false] {
++            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
++            let worker = tokio::spawn(async move {
++                let job = rx.recv().await.unwrap();
++                for event in [
++                    InferenceChunk::Ready {
++                        system_fingerprint: Some("fp-test".into()),
++                        prompt_usage: PromptUsage {
++                            prompt_tokens: 18,
++                            prompt_cache_hit_tokens: 7,
++                        },
++                    },
++                    InferenceChunk::Text { content: "4".into(), content_tokens: 1 },
++                    InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop },
++                ] {
++                    job.events.send(Ok(event)).await.unwrap();
++                }
++            });
++            let mut body = json!({"model":MODEL,"messages":[{"role":"user","content":"2+2?"}],
++                "max_tokens":16,"stream":true});
++            if include_usage {
++                body["stream_options"] = json!({"include_usage":true});
++            }
++            let response = router(tx).oneshot(axum::http::Request::post("/v1/chat/completions")
++                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
++            assert_eq!(response.status(), StatusCode::OK);
++            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
++            let text = std::str::from_utf8(&bytes).unwrap();
++            assert!(text.ends_with("data: [DONE]\n\n"));
++            let events: Vec<Value> = text.split("data: ")
++                .filter(|s| !s.trim().is_empty())
++                .filter_map(|s| s.trim_end().parse::<Value>().ok())
++                .collect();
++            let finish = events.iter().find(|e| e["choices"][0]["finish_reason"] == "stop").unwrap();
++            let usage_chunks: Vec<&Value> = events.iter()
++                .filter(|e| e["choices"] == serde_json::json!([])).collect();
++            if include_usage {
++                assert_eq!(finish["usage"], serde_json::json!(null));
++                assert_eq!(usage_chunks.len(), 1);
++                let usage = &usage_chunks[0]["usage"];
++                assert_eq!(usage["prompt_tokens"], 18);
++                assert_eq!(usage["completion_tokens"], 1);
++                assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 7);
++                assert_eq!(usage["prompt_cache_hit_tokens"], 7);
++            } else {
++                // No include_usage: the crate's documented behaviour is the final
++                // chunk carrying usage; no choices:[] chunk is synthesized.
++                assert_eq!(usage_chunks.len(), 0);
++                assert_eq!(finish["usage"]["prompt_tokens_details"]["cached_tokens"], 7);
++            }
++            worker.await.unwrap();
++        }
++    }
++    #[tokio::test]
+     async fn admission_errors_preserve_status_and_cause_before_json_or_sse() {
+         for streaming in [false, true] {
+             for bad_request in [false, true] {
+-- 
+2.43.0
+

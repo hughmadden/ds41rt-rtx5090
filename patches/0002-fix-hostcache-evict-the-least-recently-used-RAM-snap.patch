@@ -1,0 +1,429 @@
+From 27ff8c731991def9708baa232cdc0c57cfeeb2d9 Mon Sep 17 00:00:00 2001
+From: Turquoise Bay AI <11993289+hughmadden@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 21:47:00 +1000
+Subject: [PATCH 2/2] fix(hostcache): evict the least recently used RAM
+ snapshot first, not every prompt before any turn
+
+The host cache evicted through Retention::evict_one_where, the device tier's
+bank order: every prompt snapshot before any turn snapshot, oldest first
+within a bank. A prompt snapshot shares its pages with its conversation's
+turn snapshot, so deleting it frees a tail but no shared page. Under page
+pressure that order deleted every prompt snapshot, the fresh ones included,
+before the first stale turn snapshot, and an exact repeat of a recent prompt
+(a retry, a regenerate, identical agent prompts) prefilled from cold.
+Measured on a sibling engine with the same host-cache design
+(hughmadden/mimo26f-afd v1.1.1): after a 64K-1M ladder, exact repeats of
+130K-token prompts prefilled from cold in 37-41 s instead of restoring from
+RAM in about 0.2 s.
+
+Snapshots now stamps each snapshot with a use count at commit and at every
+lookup hit (HostSnapshot::last_use, unique among resident snapshots) and
+evicts the unpinned snapshot with the smallest stamp, whichever bank it is
+in; at equal use a prompt snapshot goes before a turn snapshot (victim()).
+Lookups still use the Retention radix and eviction still removes the victim
+from it, so a host hit is still exactly a Retention hit. The device tier is
+unchanged: v41_native_serve::prefix still evicts through
+Retention::evict_oldest (prompts first).
+
+One side effect of the old order is gone on purpose: commit_store's
+replace-check (Radix::lookup) refreshed the radix clock of a same-bank
+ancestor, which counted a store as a use of the ancestor. Now only a store
+of the snapshot itself or a lookup hit on it counts as a use.
+
+Tests: eviction_order_is_prompts_before_turns_oldest_first pinned the old
+order; it is replaced by
+eviction_order_is_least_recently_used_first_across_banks. New
+a_fresh_prompt_snapshot_outlives_a_stale_turn_snapshot evicts two
+conversations down to the newer one's footprint: the exact repeat of the
+newer prompt still hits (the old order evicted it). Both fail against the old
+evict_one. The HC-2/HC-5 reference model (tests/common) mirrors the new rule
+and Model::check also compares last_use. ds41rt-hostcache: 219 passed, 0
+failed; the two ignored HC-6 soaks pass when run explicitly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ rust/crates/ds41rt-hostcache/src/cache.rs     |  4 +-
+ rust/crates/ds41rt-hostcache/src/snapshot.rs  | 97 +++++++++++++------
+ .../ds41rt-hostcache/tests/common/mod.rs      | 40 +++++---
+ .../ds41rt-hostcache/tests/functional_hc2.rs  | 44 ++++++++-
+ 4 files changed, 140 insertions(+), 45 deletions(-)
+
+diff --git a/rust/crates/ds41rt-hostcache/src/cache.rs b/rust/crates/ds41rt-hostcache/src/cache.rs
+index 71077f235..a54ab60ff 100644
+--- a/rust/crates/ds41rt-hostcache/src/cache.rs
++++ b/rust/crates/ds41rt-hostcache/src/cache.rs
+@@ -855,8 +855,8 @@ impl<E: CopyEngine, P> HostCache<E, P> {
+         self.metrics.get_mut().store_drain_timeouts += 1;
+     }
+ 
+-    /// Evict in the engine's order until the pool is at or under `quota`, dropping the payloads
+-    /// of the evicted snapshots.
++    /// Evict least recently used first (`Snapshots::evict_one`) until the pool is at or under
++    /// `quota`, dropping the payloads of the evicted snapshots.
+     fn evict_to(&mut self, quota: u64) {
+         while self
+             .snapshots
+diff --git a/rust/crates/ds41rt-hostcache/src/snapshot.rs b/rust/crates/ds41rt-hostcache/src/snapshot.rs
+index f7e043234..98ad8c6f7 100644
+--- a/rust/crates/ds41rt-hostcache/src/snapshot.rs
++++ b/rust/crates/ds41rt-hostcache/src/snapshot.rs
+@@ -6,8 +6,16 @@
+ //! is never shared: a concurrent plan copies it into its own slab and the later commit releases
+ //! the duplicate in favour of a reference. Lookups use the engine's own `Retention` radix
+ //! (`ds41rt-core::prefix`), so a host hit is exactly a snapshot the device tier would have
+-//! chosen. Eviction follows the same bank order (prompts before turns, oldest access first) and
+-//! never touches a pinned snapshot.
++//! chosen. Eviction takes the least recently used snapshot (last store or lookup hit) whichever
++//! bank it is in, a prompt before a turn only at equal use (`victim`), and never touches a
++//! pinned snapshot.
++//!
++//! That departs from the device tier's bank order (`Retention::evict_one`: every prompt
++//! snapshot before any turn snapshot). A prompt snapshot shares its pages with its
++//! conversation's turn snapshot, so evicting it frees a tail but no shared page. Under page
++//! pressure the bank order deleted every prompt snapshot, the fresh ones included, before the
++//! first stale turn snapshot, and an exact repeat of a recent prompt (a retry, a regenerate,
++//! identical agent prompts) prefilled from cold.
+ use crate::pool::{Class, HostRange, PoolExhausted, Slab, SlabPool};
+ use crate::SnapshotKind;
+ use crate::COMPRESSORS;
+@@ -65,8 +73,11 @@ pub struct HostSnapshot {
+     pub draft: Option<Slab>,
+     /// The scores row, when the layout enables the class.
+     pub scores: Option<Slab>,
+-    /// Virtual-clock time of the last lookup hit, for eviction order.
++    /// Virtual-clock time of the last lookup hit (the store's time until the first hit).
+     pub last_access_ns: u64,
++    /// The store's use count at this snapshot's store or last lookup hit; eviction takes the
++    /// smallest (`victim`). Unique among resident snapshots.
++    pub last_use: u64,
+     /// Restores in flight; a pinned snapshot is never evicted.
+     pub pins: u32,
+ }
+@@ -116,8 +127,8 @@ struct PageEntry {
+ /// The store of host snapshots. Invariants: a page slab is held exactly while its reference
+ /// count is positive; the device map holds an entry only for a page that is both alive on the
+ /// device and present in a host slab, and is filled at commit so an in-flight copy is never
+-/// shared; `bytes_used()` equals the pool's; eviction order equals `Retention::evict_one` order
+-/// over unpinned snapshots.
++/// shared; `bytes_used()` equals the pool's; eviction takes the least recently used unpinned
++/// snapshot (`victim`).
+ pub struct Snapshots {
+     pool: SlabPool,
+     retention: Retention<Key>,
+@@ -128,6 +139,8 @@ pub struct Snapshots {
+     /// Device identity to the one host page that holds its bytes, while it is shareable.
+     device_map: HashMap<DevicePageId, PageRef>,
+     next_key: Key,
++    /// Stores plus lookup hits so far: the clock `HostSnapshot::last_use` is stamped from.
++    uses: u64,
+ }
+ 
+ impl Snapshots {
+@@ -142,6 +155,7 @@ impl Snapshots {
+             free_pages: Vec::new(),
+             device_map: HashMap::new(),
+             next_key: 0,
++            uses: 0,
+         }
+     }
+ 
+@@ -240,6 +254,7 @@ impl Snapshots {
+             }
+         }
+         self.retention.bank_mut(kind).insert(&meta.tokens, key);
++        self.uses += 1;
+         self.snapshots.insert(
+             key,
+             HostSnapshot {
+@@ -250,6 +265,7 @@ impl Snapshots {
+                 draft,
+                 scores,
+                 last_access_ns: now_ns,
++                last_use: self.uses,
+                 pins: 0,
+             },
+         );
+@@ -263,15 +279,18 @@ impl Snapshots {
+         self.release_slabs(plan.tail, plan.draft, plan.scores);
+     }
+ 
+-    /// The engine's reuse rule over host snapshots; refreshes the hit's access clock. Invariant:
+-    /// a hit is exactly a `Retention::lookup_reusable` hit over the resident snapshots.
++    /// The engine's reuse rule over host snapshots; refreshes the hit's access clock and use.
++    /// Invariant: a hit is exactly a `Retention::lookup_reusable` hit over the resident
++    /// snapshots.
+     pub fn lookup(&mut self, tokens: &[u32], now_ns: u64) -> Option<Hit> {
+         let (common, frontier, key) = {
+             let (common, frontier, &key) = self.retention.lookup_reusable(tokens)?;
+             (common, frontier, key)
+         };
+         let snapshot = self.snapshots.get_mut(&key)?;
++        self.uses += 1;
+         snapshot.last_access_ns = now_ns;
++        snapshot.last_use = self.uses;
+         Some(Hit {
+             key,
+             kind: snapshot.meta.kind,
+@@ -316,28 +335,24 @@ impl Snapshots {
+         }
+     }
+ 
+-    /// Evict the least recently used unpinned snapshot; returns its key and the bytes freed, or
+-    /// `None` when only pinned snapshots remain. Invariant: a pinned snapshot is never evicted.
++    /// Evict the least recently used unpinned snapshot (`victim`), from either bank; returns its
++    /// key and the bytes freed, or `None` when only pinned snapshots remain. Invariant: a pinned
++    /// snapshot is never evicted.
+     pub fn evict_one(&mut self) -> Option<(Key, u64)> {
+-        loop {
+-            let next = {
+-                let snapshots = &self.snapshots;
+-                self.retention.evict_one_where(&|key: &Key| {
+-                    snapshots.get(key).is_some_and(|snapshot| snapshot.pins > 0)
+-                })
+-            };
+-            let (_kind, key) = next?;
+-            let before = self.pool.bytes_used();
+-            if let Some(snapshot) = self.snapshots.remove(&key) {
+-                self.release_snapshot(snapshot);
+-                return Some((key, before - self.pool.bytes_used()));
+-            }
+-        }
+-    }
+-
+-    /// Evict in the engine's order until `bytes_used() <= quota`, skipping pinned snapshots;
+-    /// returns the evicted keys and the bytes freed. Invariant: a pinned snapshot is never
+-    /// evicted; stops early if only pinned snapshots remain.
++        let key = victim(
++            self.snapshots
++                .values()
++                .filter(|snapshot| snapshot.pins == 0)
++                .map(|snapshot| (snapshot.key, snapshot.meta.kind, snapshot.last_use)),
++        )?;
++        let before = self.pool.bytes_used();
++        self.remove(key);
++        Some((key, before - self.pool.bytes_used()))
++    }
++
++    /// Evict least recently used first until `bytes_used() <= quota`, skipping pinned
++    /// snapshots; returns the evicted keys and the bytes freed. Invariant: a pinned snapshot is
++    /// never evicted; stops early if only pinned snapshots remain.
+     pub fn evict_to(&mut self, quota: u64) -> (Vec<Key>, u64) {
+         let mut evicted = Vec::new();
+         let mut freed = 0;
+@@ -583,6 +598,16 @@ impl Snapshots {
+     }
+ }
+ 
++/// The snapshot RAM eviction deletes next, from `(key, kind, last_use)` of the unpinned
++/// snapshots: the least recently used; at equal use a prompt snapshot before a turn snapshot.
++/// A conversation's prompt snapshot is stored before its turn snapshot, so a stale pair goes
++/// prompt first; across conversations age decides, whatever the bank.
++fn victim(snapshots: impl Iterator<Item = (Key, SnapshotKind, u64)>) -> Option<Key> {
++    snapshots
++        .min_by_key(|&(_, kind, last_use)| (last_use, kind == SnapshotKind::Turn))
++        .map(|(key, _, _)| key)
++}
++
+ /// Test support for the snapshot suites: builders for device pages, metadata and stores. Hidden
+ /// from the public docs; the unit tests and both integration suites share it.
+ #[doc(hidden)]
+@@ -796,7 +821,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn eviction_skips_pinned_and_follows_bank_order() {
++    fn eviction_skips_pinned_and_takes_least_recently_used() {
+         let mut store = snapshots(1 << 30);
+         let prompt = store
+             .plan_store(
+@@ -840,7 +865,21 @@ mod tests {
+         assert_eq!(hit.kind, SnapshotKind::Turn);
+         assert_eq!((hit.common, hit.frontier), (4, 4));
+         assert_eq!(store.get(key).expect("snapshot").last_access_ns, 42);
++        assert_eq!(store.get(key).expect("snapshot").last_use, 2);
+         assert!(store.lookup(&[9], 43).is_none());
++        assert_eq!(store.get(key).expect("snapshot").last_use, 2);
++    }
++
++    #[test]
++    fn victim_is_least_recently_used_then_prompt_before_turn() {
++        use SnapshotKind::{Prompt, Turn};
++        // A stale turn snapshot goes before a fresh prompt snapshot.
++        let snapshots = [(0, Turn, 3), (1, Prompt, 9), (2, Turn, 10)];
++        assert_eq!(victim(snapshots.into_iter()), Some(0));
++        // At equal use the prompt snapshot goes first.
++        let snapshots = [(3, Turn, 5), (4, Prompt, 5)];
++        assert_eq!(victim(snapshots.into_iter()), Some(4));
++        assert_eq!(victim(std::iter::empty()), None);
+     }
+ 
+     #[test]
+diff --git a/rust/crates/ds41rt-hostcache/tests/common/mod.rs b/rust/crates/ds41rt-hostcache/tests/common/mod.rs
+index a81b971ed..5dfdbae51 100644
+--- a/rust/crates/ds41rt-hostcache/tests/common/mod.rs
++++ b/rust/crates/ds41rt-hostcache/tests/common/mod.rs
+@@ -49,6 +49,8 @@ pub struct Model {
+     pub next_key: Key,
+     pub next_page: u32,
+     pub layout: Layout,
++    /// Commits plus lookup hits so far; `ModelSnapshot::last_use` is stamped from it.
++    pub uses: u64,
+ }
+ 
+ pub struct ModelSnapshot {
+@@ -57,6 +59,8 @@ pub struct ModelSnapshot {
+     pub pages: Vec<u32>,
+     pub has_draft: bool,
+     pub pins: u32,
++    /// `uses` at the commit or the last lookup hit: eviction takes the smallest.
++    pub last_use: u64,
+ }
+ 
+ /// A planned store: the pages it holds, the copies it still owes and the non-page bytes it
+@@ -83,6 +87,7 @@ impl Model {
+             next_key: 0,
+             next_page: 0,
+             layout: layout(),
++            uses: 0,
+         }
+     }
+ 
+@@ -164,6 +169,7 @@ impl Model {
+             self.release(old);
+         }
+         self.retention.bank_mut(meta.kind).insert(&meta.tokens, key);
++        self.uses += 1;
+         self.snapshots.insert(
+             key,
+             ModelSnapshot {
+@@ -172,6 +178,7 @@ impl Model {
+                 pages: pages.into_iter().flatten().collect(),
+                 has_draft: meta.has_draft,
+                 pins: 0,
++                last_use: self.uses,
+             },
+         );
+         key
+@@ -229,10 +236,18 @@ impl Model {
+         }
+     }
+ 
++    /// The reuse rule; a hit refreshes the snapshot's use.
+     pub fn lookup(&mut self, tokens: &[u32]) -> Option<(usize, usize, Key)> {
+-        self.retention
++        let hit = self
++            .retention
+             .lookup_reusable(tokens)
+-            .map(|(common, frontier, &key)| (common, frontier, key))
++            .map(|(common, frontier, &key)| (common, frontier, key))?;
++        self.uses += 1;
++        self.snapshots
++            .get_mut(&hit.2)
++            .expect("model hit is resident")
++            .last_use = self.uses;
++        Some(hit)
+     }
+ 
+     pub fn evict_to(&mut self, quota: u64) -> (Vec<Key>, u64) {
+@@ -248,18 +263,18 @@ impl Model {
+         (evicted, freed)
+     }
+ 
+-    /// Evict the least recently used unpinned snapshot; `None` when only pinned snapshots
+-    /// remain. Mirrors `Snapshots::evict_one`.
++    /// Evict the least recently used unpinned snapshot, whichever bank it is in (a prompt before
++    /// a turn at equal use); `None` when only pinned snapshots remain. Mirrors
++    /// `Snapshots::evict_one`.
+     pub fn evict_one(&mut self) -> Option<(Key, u64)> {
+-        let next = {
+-            let snapshots = &self.snapshots;
+-            self.retention.evict_one_where(&|key: &Key| {
+-                snapshots.get(key).is_some_and(|snapshot| snapshot.pins > 0)
+-            })
+-        };
+-        let (_kind, key) = next?;
++        let key = self
++            .snapshots
++            .iter()
++            .filter(|(_, snapshot)| snapshot.pins == 0)
++            .min_by_key(|(_, snapshot)| (snapshot.last_use, snapshot.kind == SnapshotKind::Turn))
++            .map(|(&key, _)| key)?;
+         let before = self.bytes;
+-        self.release(key);
++        self.remove(key);
+         Some((key, before - self.bytes))
+     }
+ 
+@@ -320,6 +335,7 @@ impl Model {
+             assert_eq!(actual.meta.kind, expected.kind);
+             assert_eq!(actual.meta.tokens, expected.tokens);
+             assert_eq!(actual.pins, expected.pins);
++            assert_eq!(actual.last_use, expected.last_use, "last use of {key}");
+         }
+     }
+ }
+diff --git a/rust/crates/ds41rt-hostcache/tests/functional_hc2.rs b/rust/crates/ds41rt-hostcache/tests/functional_hc2.rs
+index 66ea9191c..fb12abb2d 100644
+--- a/rust/crates/ds41rt-hostcache/tests/functional_hc2.rs
++++ b/rust/crates/ds41rt-hostcache/tests/functional_hc2.rs
+@@ -172,7 +172,9 @@ fn a_snapshot_pinned_twice_survives_one_unpin() {
+ }
+ 
+ #[test]
+-fn eviction_order_is_prompts_before_turns_oldest_first() {
++fn eviction_order_is_least_recently_used_first_across_banks() {
++    // Replaces `eviction_order_is_prompts_before_turns_oldest_first` ([p1, p2, t1]): the bank
++    // order deleted the prompt snapshot p2 although a lookup had just used it.
+     let mut store = snapshots(1 << 30);
+     let p1 = store
+         .plan_store(meta(SnapshotKind::Prompt, &[1], false), &pages(&[id(1)]))
+@@ -188,7 +190,45 @@ fn eviction_order_is_prompts_before_turns_oldest_first() {
+     let t1 = store.commit_store(t1, 2);
+     assert!(store.lookup(&[2], 3).is_some());
+     let (evicted, _) = store.evict_to(0);
+-    assert_eq!(evicted, vec![p1, p2, t1]);
++    assert_eq!(evicted, vec![p1, t1, p2]);
++}
++
++#[test]
++fn a_fresh_prompt_snapshot_outlives_a_stale_turn_snapshot() {
++    // Two conversations, each a prompt snapshot plus a turn snapshot that shares its pages; A
++    // is older than B. Evict down to exactly B's footprint.
++    let mut store = snapshots(1 << 30);
++    let mut now = 0;
++    let mut commit = |kind, tokens: &[u32], ids: &[u32]| {
++        let ids: Vec<DevicePageId> = ids.iter().map(|&page| id(page)).collect();
++        let plan = store
++            .plan_store(meta(kind, tokens, false), &pages(&ids))
++            .expect("plan");
++        now += 1;
++        store.commit_store(plan, now)
++    };
++    let a_prompt = commit(SnapshotKind::Prompt, &[1, 2, 3, 4], &[1, 2]);
++    let a_turn = commit(SnapshotKind::Turn, &[1, 2, 3, 4, 5, 6], &[1, 2, 3]);
++    let b_prompt = commit(SnapshotKind::Prompt, &[11, 12, 13, 14], &[11, 12]);
++    commit(SnapshotKind::Turn, &[11, 12, 13, 14, 15, 16], &[11, 12, 13]);
++    let layout = ds41rt_hostcache::pool::testing::layout();
++    let b_bytes = 2 * (layout.tail + layout.scores) as u64 + 3 * layout.page as u64;
++
++    // Deleting A's prompt snapshot frees its tail only (its pages are A's turn's too), so A's
++    // turn snapshot goes next. The bank order deleted B's fresh prompt snapshot before A's
++    // stale turn ([a_prompt, b_prompt, a_turn]) and left only B's turn.
++    let (evicted, _) = store.evict_to(b_bytes);
++    assert_eq!(evicted, vec![a_prompt, a_turn]);
++    assert_eq!(store.bytes_used(), b_bytes);
++
++    // An exact repeat of B's prompt still restores from RAM instead of prefilling.
++    let hit = store
++        .lookup(&[11, 12, 13, 14], 5)
++        .expect("fresh prompt snapshot resident");
++    assert_eq!(hit.key, b_prompt);
++    assert_eq!(hit.kind, SnapshotKind::Prompt);
++    assert_eq!((hit.common, hit.frontier), (4, 4));
++    assert!(store.lookup(&[1, 2, 3, 4], 6).is_none());
+ }
+ 
+ #[test]
+-- 
+2.43.0
+

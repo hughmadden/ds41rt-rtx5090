@@ -1,7 +1,8 @@
 # The gates: what decides whether DS41RT's coordinator runs on a 32 GB RTX 5090
 
 Three findings, each measured on the 5090 before any Spark was involved, plus the one fabric
-fault that stopped the first real boot. All dates are 2026-09-13/14 (Sydney).
+fault that stopped the first real boot. Sections 1-4 are dated 2026-09-13/14 (Sydney, DS41RT v1);
+section 5 re-checks them on DS41RT v15 (2026-09-26).
 
 ## 1. The published coordinator image cannot start on a 5090 (AOT SM-count gate)
 
@@ -118,3 +119,44 @@ the map: RTR/RTS pass, persistent connections establish, requests serve. The lau
 require `FABRIC_IP` + `RDMA_DEVICE` (experts) and `DEVICE_MAP` (coordinator) and refuse to
 start without them. Find the device with `ibv_devices` / `ibdev2netdev` and the address with
 `ip -4 addr`.
+
+## 5. DS41RT v15 (2026-09-26): what changed for these gates
+
+**The SM-count gate still applies (§1).** Upstream `bfae964c` ("Serve same-capability parts with
+fewer SMs") relaxed only `ds41rt_v41_expert_initialize`, which now warns and clamps. Two checks
+still reject a device whose SM count differs from the export's:
+- `native/src/v41_fp8.cc` `ds41rt_v41_fp8_matrix_initialize`;
+- `native/src/v41_experts.cc` `ds41rt_v41_expert_input_quant_initialize`.
+
+So `ghcr.io/tpurtell/ds41rt-coordinator:v15`, exported on 188 SMs, still cannot serve on a 5090,
+and the rebuild remains the fix. Our v15 build prints `physical_sms = 170` in both
+`V41_FP8_AOT.json` and `V41_EXPERT_AOT.json`; its labels read revision `27ff8c73` (v15 +
+`patches/`), SparkInfer `7fcc094e`, CUDA arch 120. The published v15 Spark image is used
+unchanged (image ID `sha256:0a6c0fae…`).
+
+**The memory plan at the production point (§2).** Capacity 1024, dSpark, concurrency 16, prefix
+retention 24, `--memory-reservation 97%`, 24 GiB host cache. The boot line reads
+`cache_bytes=1996182016` (1.86 GiB pool; v1 auto-sized 2.07 GiB) with 2 GiB runtime headroom, and
+`nvidia-smi` shows 29,200 MiB used / 2,951 MiB free. v15 adds lane-local dSpark draft workspaces
+(466 MB in all), which explains most of the smaller pool. A 1,020,840-token prompt still fits.
+
+**The multi-port RDMA map (§4) is still required**, on every rank and on the coordinator.
+
+**A bonded coordinator port balances per boot.** If the coordinator's RoCE link is two ports in an
+LACP bond, the switch hashes the four experts' flows onto the ports when the coordinator starts,
+and the split changes on every restart. An uneven split (3+1 or 4+0) adds 25-130 ms to time to
+first token and retransmits; decode is unaffected. Before measuring anything:
+1. send four concurrent ~6K-token prompts;
+2. read the two ports' `rx_bytes_phy` deltas (`ethtool -S`);
+3. accept a port-0 share of 42-58%, otherwise `docker restart` the coordinator and repeat.
+
+Our v15 boot needed one restart (26.0% → 26.9% → 45.1%).
+
+**One regression, at the top of the context (MISS).** An exact repeat of a 1,020,840-token prompt
+took 10.4 s on v15 against 0.76 s on v3, while every shorter rung matched or improved (§ SETTINGS).
+- On v3 the repeat was a device hit: one eviction, no restores.
+- On v15 the repeat request first evicted 63 device snapshots, including the one it was about to
+  reuse, then restored it from host RAM (5 restores, 1.88 GB). The restores themselves took 96 ms.
+- Our reading: upstream's v6 change "Queue KV admission against complete request token budgets"
+  reserves the whole request budget at admission, and at ~1M that budget no longer fits beside the
+  retained snapshot. This is an inference from the counters, not a traced cause.

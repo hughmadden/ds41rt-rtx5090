@@ -14,7 +14,7 @@
 # Usage: afd-plan-probe.sh <tag> <prefill-batch-tokens> <concurrency> <dspark on|off> [pool]
 set -uo pipefail
 MODEL_DIR=${MODEL_DIR:?set MODEL_DIR to the DeepSeek-V4.1-Flash snapshot directory}
-IMAGE=${IMAGE:-ghcr.io/tpurtell/ds41rt-coordinator:v1}
+IMAGE=${IMAGE:-ds41rt-coordinator-rtx5090:v15}
 NATIVE_LIB=${NATIVE_LIB:-/opt/ds41rt/lib/libds41rt_native.so}
 OUT=${OUT:-$PWD/afd-plan}
 WAIT_S=${WAIT_S:-420}
