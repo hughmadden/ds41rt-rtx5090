@@ -17,8 +17,12 @@ tool calls, and a live console; see upstream's release notes. Measured on our fl
 - one regression: an exact repeat of a ~1M-token prompt takes 10.4 s (0.76 s on v3), because the
   repeat evicts and restores its own snapshot (`docs/GATES.md` §5).
 
-Measured results for v1 (prefill, decode, 1M context, concurrency) are in the public report:
-**https://services.turquoisebay.ai/share/dsv41-afd-hybrid/**
+The first public report (prefill, decode, 1M context, concurrency) measured DS41RT **v2**
+(`9477b6e`), built on the 5090 by the same method:
+**https://services.turquoisebay.ai/share/dsv41-afd-hybrid/**. To rebuild that engine with release
+1.0.0's script, which defaults to v1, pass `REV=9477b6e39f4bbe431c4cd6d48c8b303045f9238f` and
+`SPARKINFER_COMMIT=bae6e5cf08fc7e51e8ea40f287dcfa95440036fc` (v2's SparkInfer lock), and run the
+published `ghcr.io/tpurtell/ds41rt-spark-expert:v2` on the Sparks.
 
 ## Part 2: the host-RAM snapshot cache benchmark harness
 
@@ -122,7 +126,8 @@ upstream as tpurtell/ds41rt#1 on 2026-09-14.
 - v1 (2026-09-14): two operating points, one flag pair: prefill capacity 1024 (default; prefill
   5,377 tok/s at 170k prompt tokens, 2.5M-token KV pool) or capacity 256 (`BATCH=80` and
   `CAPACITY=256`; prefill 2,000 tok/s, 7.79M-token pool). Decode is the same at both (74 vs 73.5
-  tok/s). The widening was suggested by DS41RT's author and measured the same day.
+  tok/s). The widening was suggested by DS41RT's author and measured the same day. The fleet
+  moved to v2 that afternoon (5,717 tok/s at 170k, decode 76.7 tok/s); the report shows v2.
 - The like-for-like baseline (the same four Sparks running the reference TP4 vLLM deployment,
   same prompts, same bench) has not been run yet. The report says so where it matters.
 - The Engram dedicated-tier script is optional and was **not** needed for the measured results:

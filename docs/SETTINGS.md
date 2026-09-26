@@ -91,10 +91,14 @@ tool calls, reasoning, long prompts): 542 requests completed, 0 errors, 0 queue 
 tokens (about 228 tok/s aggregate), 71.9% of verified drafts accepted, 76 tool calls decoded with
 drafts on.
 
-## What v1 measured (2026-09-14)
+## What v1 and v2 measured (2026-09-14)
 
-Summarised from the report (https://services.turquoisebay.ai/share/dsv41-afd-hybrid/), all
-single runs, temperature 0, dSpark on:
+The first measurements ran on DS41RT v1 (the table below). The fleet moved to v2 (`9477b6e`) the
+same afternoon, and the report (https://services.turquoisebay.ai/share/dsv41-afd-hybrid/) shows
+the v2 numbers. v2 at capacity 1024, same prompts: 21k / 85k / 170k / 1M prompt tokens at 4,101 /
+5,552 / 5,717 / 4,106 tok/s cold, 1M exact reuse 0.8 s, decode 76.7 tok/s.
+
+v1, all single runs, temperature 0, dSpark on:
 
 | | value |
 |---|---|
