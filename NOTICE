@@ -5,6 +5,11 @@ the invocation shapes of DS41RT's own run.sh and build.sh, that is deliberate so
 the launches stay comparable with upstream's; the credit for those shapes is
 upstream's.
 
+patches/0003 reimplements the copy-window drafting rule of TensorFold
+(https://github.com/ashhart/TensorFold, MIT licence, copyright its authors) from its
+description: an 8-token match against the request's own history, then the tokens that
+followed as drafts. No TensorFold source is included.
+
 DeepSeek-V4.1-Flash is DeepSeek's checkpoint, under its own licence. No weights or
 images are distributed here.
 

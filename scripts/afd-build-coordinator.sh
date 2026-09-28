@@ -17,6 +17,9 @@
 # commit (EXPECT_HEAD) because the patches carry their author and dates:
 #   0001  streamed include_usage: usage in a final choices:[] chunk (LiteLLM keeps cached_tokens)
 #   0002  host cache: RAM eviction least recently used first, not every prompt before any turn
+#   0003  copy-window drafts: when a greedy request's last 8 tokens occurred earlier in its
+#         history, the tokens that followed are that round's drafts instead of dSpark's (idea
+#         from ashhart/TensorFold, MIT); DS41RT_COPY_DRAFTS=0 turns it off
 # PATCHES=none builds upstream bd06bec unchanged.
 #
 # Needs the whole GPU for step 2 (the export). Run detached; watch $OUT/build.log.
@@ -32,7 +35,7 @@ CUDA_ARCH=${CUDA_ARCH:-120}
 # docs and configs on top of it.
 REV=${REV:-bd06bec42e219a65097235dd9092e4a0537d4b7a}
 PATCHES=${PATCHES:-on}
-EXPECT_HEAD=${EXPECT_HEAD:-27ff8c731991def9708baa232cdc0c57cfeeb2d9}
+EXPECT_HEAD=${EXPECT_HEAD:-51b85c8bad57ed4616f72a13a4dcd2155e0f9058}
 SPARKINFER_PIN=${SPARKINFER_PIN:-7fcc094edcc93af61fdfbe14300100e3204363ea}
 PATCH_DIR="$(cd "$(dirname "$0")/.." && pwd)/patches"
 

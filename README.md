@@ -17,6 +17,20 @@ tool calls, and a live console; see upstream's release notes. Measured on our fl
 - one regression: an exact repeat of a ~1M-token prompt takes 10.4 s (0.76 s on v3), because the
   repeat evicts and restores its own snapshot (`docs/GATES.md` §5).
 
+**Release 2.1.0 (2026-09-28) adds `patches/0003`, copy-window drafts.** The rule comes from
+[ashhart/TensorFold](https://github.com/ashhart/TensorFold) (MIT). When a greedy request's last 8 tokens
+occurred earlier in its history, the tokens that followed are that round's drafts instead of dSpark's.
+The target verifies them the same way, so outputs do not change. Measured on our fleet on 2026-09-28
+(one stream, greedy, reasoning off, median of 3):
+- files written back with one name changed: +7–18% (143.7 → 159.9–169.3 and 142.3 → 152.9–163.0 tok/s,
+  two quiet runs);
+- a function quoted verbatim: +5–6%;
+- fresh code and prose: unchanged;
+- 95% of copied drafts accepted.
+
+A 6-minute, 16-worker mixed soak produced as many tokens as v15 (78,874 vs 78,541) with 0 errors.
+`DS41RT_COPY_DRAFTS=0` turns it off.
+
 The first public report (prefill, decode, 1M context, concurrency) measured DS41RT **v2**
 (`9477b6e`), built on the 5090 by the same method:
 **https://services.turquoisebay.ai/share/dsv41-afd-hybrid/**. To rebuild that engine with release
@@ -36,7 +50,7 @@ second report in this series, **"Same hardware, double the work: a write-back KV
 | Path | What it is |
 |---|---|
 | `scripts/afd-build-coordinator.sh` | Rebuilds the coordinator image at DS41RT v15 (`bd06bec`) **on the 5090**, so the AOT kernel export reads that GPU's SM count; applies `patches/` unless `PATCHES=none`. |
-| `patches/` | Two fixes on top of v15, both independent of the 5090 port (below). `git am` lands on `27ff8c73`. |
+| `patches/` | Three patches on top of v15, all independent of the 5090 port (below): two fixes and copy-window drafts. `git am` lands on `51b85c8b`. |
 | `scripts/afd-plan-probe.sh` | Boots the coordinator with loopback peers (no Sparks) far enough to read the memory planner's line. How the memory matrix in `docs/GATES.md` was measured. |
 | `scripts/afd-ready-probe.sh` | Boots to readiness with loopback peers and serves `/health` and `/v1/models`. The last offline gate. |
 | `scripts/afd-preflight.sh` | Read-only GO/NO-GO across the coordinator host and all four Sparks (image revisions, AOT SM count, model shards, ports, memory headroom). `--json` available. |
@@ -64,6 +78,21 @@ second report in this series, **"Same hardware, double the work: a write-back KV
   the least recently used snapshot first; at equal use, a prompt before a turn. Unit-tested in the
   cache crate: 219 pass, including the two soaks. The same defect and fix were measured on our
   MiMo engine (hughmadden/mimo26f-afd v1.1.1).
+
+- **`0003` copy-window drafts.** Agent output often repeats its context: a file written back with
+  one name changed, an edit call quoting the lines it replaces.
+  - **The rule.** When a greedy request's history ends with 8 tokens that occurred earlier in it, up to
+    the draft limit (5 by default) of the tokens that followed the latest earlier occurrence become
+    that round's drafts, and dSpark skips that request for the round. Its accepted rows still reach
+    dSpark's window through the batch commit.
+  - **Verification** is the same sample-and-match rule, so outputs do not change.
+  - **When it stops.** A copy that accepts nothing pauses copying for that request for two rounds.
+    Sampled requests never copy: in a mixed soak where a third of requests ran at temperature 0.7,
+    copying for them too cost 2% of output, against parity for greedy-only copying.
+  - **The length policy** learns only from dSpark's own drafts.
+  - `/v1/stats` reports `copy_drafts`; `DS41RT_COPY_DRAFTS=0` turns it off.
+  - The idea and its 8-token entry come from ashhart/TensorFold (MIT), reimplemented from its
+    description. Measurements are above.
 
 ## Prerequisites
 
@@ -103,7 +132,7 @@ constant generated at AOT export time from whichever GPU ran the export: 188 on 
 6000, 170 on the 5090. Patching the check out would be unsound, because the same constant
 sizes the launch grids and cluster limits. Running the vendor's own build on the 5090 regenerates
 everything for 170 SMs (`docs/GATES.md`). At v15 this is still the case: upstream relaxed only the
-expert GEMM check. The two `patches/` are unrelated bug fixes; `PATCHES=none` builds upstream v15
+expert GEMM check. The three `patches/` are unrelated to the port (two bug fixes and copy-window drafts); `PATCHES=none` builds upstream v15
 with the SM count as the only delta from the published image.
 
 The error now names the expected and observed SM counts: our diagnostic pull request was merged
@@ -111,6 +140,15 @@ upstream as tpurtell/ds41rt#1 on 2026-09-14.
 
 ## Status and honesty
 
+- 2.1.0 (`0003`), measured on one fleet on 2026-09-28 (Sydney):
+  - the copy bench above;
+  - sampled decode at 200 and 512 tokens, unchanged;
+  - API rows 5/5 and the v15 rows;
+  - a 6-minute 16-worker soak against v15 with the same script, 0 errors on the coordinator and all
+    four ranks;
+  - an agent task through a LiteLLM front door, with tool calls.
+
+  The live fleet also served requests during some runs, so single wall-clock cells carry about ±10%.
 - v15: measured on one fleet on 2026-09-26 (Sydney), single runs per cell except one-stream decode
   (three runs). The v3 comparison is the same ladder run on our v3 build on 2026-09-23 and the same
   decode cell from 2026-09-15.
@@ -139,7 +177,10 @@ upstream as tpurtell/ds41rt#1 on 2026-09-14.
 - **DeepSeek** — the DeepSeek-V4.1-Flash checkpoint.
 - **tonyd2wild** — the TP4 DGX-Spark vLLM reference deployment the report compares against.
 - **Local Inference Labs** — the standard benchmark used in the report.
+- **ashhart/TensorFold** (MIT) — the copy-window drafting rule in `patches/0003` (a verbatim
+  continuation from the request's own history, entered after 8 matching tokens), reimplemented
+  from its description (https://github.com/ashhart/TensorFold).
 
 The 5090 port, the scripts, the measurements and the docs here are Turquoise Bay AI's work,
 released under the MIT licence (`LICENSE`). Upstream files retain their own terms (`NOTICE`),
-including the upstream files the two `patches/` change.
+including the upstream files the three `patches/` change.

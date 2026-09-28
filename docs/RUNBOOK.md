@@ -13,7 +13,7 @@ REPO=$PWD/ds41rt scripts/afd-build-coordinator.sh  # PATCHES=none for upstream v
 
 Three steps, mirroring upstream `build.sh`: dev image, GPU-enabled artifact compile (the AOT
 export reads this GPU's SM count here), release image. The GPU must be free for step 2. Before
-step 1 the script checks out v15 (`bd06bec`), applies `patches/` (HEAD must become `27ff8c73`),
+step 1 the script checks out v15 (`bd06bec`), applies `patches/` (HEAD must become `51b85c8b`; `27ff8c73` before release 2.1.0),
 and verifies the SparkInfer (`7fcc094e`) and XGrammar sources. Expect the log to print
 `physical_sms = 170` for both AOT manifests. Output: `ds41rt-coordinator-rtx5090:v15`.
 

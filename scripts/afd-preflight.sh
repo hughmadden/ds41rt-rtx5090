@@ -15,7 +15,7 @@ MODEL_DIR=${MODEL_DIR:?set MODEL_DIR to the DeepSeek-V4.1-Flash snapshot directo
 SPARK_MODEL_DIR=${SPARK_MODEL_DIR:-/models/DeepSeek-V4.1-Flash}
 ENGRAM_MNT=${ENGRAM_MNT:-}            # optional: mount point of a dedicated Engram device
 # v15 + patches/ (afd-build-coordinator.sh PATCHES=on); upstream bd06bec4 with PATCHES=none.
-EXPECT_REV=${EXPECT_REV:-27ff8c731991def9708baa232cdc0c57cfeeb2d9}
+EXPECT_REV=${EXPECT_REV:-51b85c8bad57ed4616f72a13a4dcd2155e0f9058}
 EXPECT_SPARKINFER=${EXPECT_SPARKINFER:-7fcc094edcc93af61fdfbe14300100e3204363ea}
 EXPECT_SMS=${EXPECT_SMS:-170}
 read -r -a SPARK_HOSTS <<<"${SPARK_HOSTS:?set SPARK_HOSTS to the four expert hosts in rank order, space-separated}"

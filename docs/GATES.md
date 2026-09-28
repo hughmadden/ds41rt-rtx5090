@@ -131,7 +131,7 @@ still reject a device whose SM count differs from the export's:
 So `ghcr.io/tpurtell/ds41rt-coordinator:v15`, exported on 188 SMs, still cannot serve on a 5090,
 and the rebuild remains the fix. Our v15 build prints `physical_sms = 170` in both
 `V41_FP8_AOT.json` and `V41_EXPERT_AOT.json`; its labels read revision `27ff8c73` (v15 +
-`patches/`), SparkInfer `7fcc094e`, CUDA arch 120. The published v15 Spark image is used
+`patches/` 0001–0002; release 2.1.0 adds 0003 and reads `51b85c8b`), SparkInfer `7fcc094e`, CUDA arch 120. The published v15 Spark image is used
 unchanged (image ID `sha256:0a6c0fae…`).
 
 **The memory plan at the production point (§2).** Capacity 1024, dSpark, concurrency 16, prefix

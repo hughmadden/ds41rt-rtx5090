@@ -1,0 +1,1046 @@
+From 51b85c8bad57ed4616f72a13a4dcd2155e0f9058 Mon Sep 17 00:00:00 2001
+From: Turquoise Bay AI <11993289+hughmadden@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 09:57:10 +1000
+Subject: [PATCH] feat(dspark): copy-window drafts from the request's own
+ history
+
+Agent output often repeats its context: file edits, tool-call arguments that
+quote code, paths. When a greedy request's token history (prompt plus
+emitted tokens) ends with eight tokens that occurred earlier in that history, the
+tokens that followed the most recent earlier occurrence are now that round's
+drafts in place of dSpark's. The target verifies them with the same
+sample-and-match rule as dSpark drafts, so the output is unchanged; only the
+tokens committed per round change. The rule comes from ashhart/TensorFold
+(MIT), reimplemented from its description.
+
+Proposer (v41_native_serve/copy_drafts.rs): per request, a std HashMap from
+each eight-token window's 64-bit hash to the absolute end position of its
+latest occurrence (16-byte entries, a pass-through hasher over the mixed
+key), built on the request's first decode round and extended by the tokens
+emitted since. The anchor's own window is indexed only in a later round, so
+a lookup finds earlier occurrences only, and a candidate is copied only
+after its tokens match, since keys can collide. A proposal carries at least
+two and at most min(draft limit, remaining budget - 1) tokens, the bound
+dSpark's proposals obey. When the source ends fewer tokens before the anchor
+than that cap, copying continues from the same distance, so a run or a short
+repeat fills the window, as re-matching after each accepted token would. A
+copy round that accepts nothing pauses copying for that request for two
+rounds. A copy takes the same grammar truncation as dSpark drafts, and one
+cut below two tokens is dropped so dSpark drafts the request. Sampled
+requests never copy: their draws leave copied text more often, and a copy
+that fails costs the request dSpark's drafts for that round. In a mixed soak
+with a third of requests at temperature 0.7, copied drafts were accepted 52%
+of the time, against 95% on greedy file rewrites.
+
+Scheduler: a copying request is left out of that round's dSpark draft, in
+both the single-lane propose and the independent-lane poll_propose, so the
+chain drafts only the other requests and a lane whose requests all copy runs
+no draft pass. Leaving a request out is safe. Chain graphs are keyed by
+request count and width and captured on first use. dSpark's per-request
+state is its committed window rows, and the batch commit writes those from
+the target's taps for every batch member, drafted or not, as it already does
+for a request whose budget allows no draft. DraftRuntime::skip_copied clears
+the copying requests' stale confidence and marks a lane with no draft pass
+(width 0).
+
+Length policy: a copy bypasses select_lengths and is verified whole; the
+policy selects the other requests' lengths as before (select_lengths now
+accepts an empty candidate list). The round observation moved into
+speculative/policy.rs::observe, unchanged for rounds without copies. A
+copying request is observed without confidence, so calibration, per-request
+outcomes and recent confidence learn from dSpark drafts only, while its rows
+and routes still feed the layer and round fits and its route history. A
+round with a copy keeps no prediction, so the time bias does not move. A
+draft pass beside a copy covered fewer requests than the lane, so that round
+gives no draft-cost sample and its draft time is taken out of the round
+total, which leaves the round fit's residual as a round without copies
+would.
+
+DS41RT_COPY_DRAFTS=0 disables copy windows (default on; they need dSpark).
+The serving worker logs one line at startup saying whether they are on, and
+/v1/stats reports copy_drafts {request_rounds, verified_drafts,
+accepted_drafts}; dspark_policy's acceptance totals include those rows. With
+copies off, or in a lane round in which no request copies, the round makes
+the same draft, verification and policy calls, with the same inputs, as
+before. README and docs/dspark-bandwidth-policy.md describe the rule and its
+policy handling.
+
+Tests: copy_drafts has ten unit tests covering latest-occurrence matching,
+the eight-token entry, the two-to-cap length, overlapping sources and runs,
+no self-match, a planted key collision, the backoff, the budget cap, merge
+order, and the incrementally built index against a brute-force search at
+every length of a 3,000-token sequence. policy.rs adds
+rounds_without_copies_observe_as_before (identical policy state to the
+previous observation) and
+copy_rounds_teach_costs_but_never_the_drafters_evidence. Breaking the
+confidence exclusion, the draft-time adjustment, the periodic continuation
+or the latest-occurrence index each fails a test. No CPU harness drives a
+lane round (target passes, draft chains and the request bank need CUDA), so
+the exclusion and commit path are covered by reading, not by an integration
+test. CPU suite (just test-rust-fast, --locked): 1,920 passed, 8 failed, 142
+ignored. The parent gives 1,908 passed with the same 8 failures: five
+target-attention tests and one graph-capture test that need Python torch,
+one ds41rt-ffi geometry test, and the stale admission test that expects 503
+where the queue now answers 429.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                                     |  12 +
+ docs/dspark-bandwidth-policy.md               |  19 +
+ .../ds41rt-daemon/src/v41_native_serve.rs     |   1 +
+ .../src/v41_native_serve/copy_drafts.rs       | 385 ++++++++++++++++++
+ .../src/v41_native_serve/scheduler.rs         |  86 +++-
+ .../v41_native_serve/scheduler/independent.rs |  35 +-
+ .../src/v41_native_serve/speculative.rs       |  37 +-
+ .../v41_native_serve/speculative/policy.rs    | 125 +++++-
+ 8 files changed, 659 insertions(+), 41 deletions(-)
+ create mode 100644 rust/crates/ds41rt-daemon/src/v41_native_serve/copy_drafts.rs
+
+diff --git a/README.md b/README.md
+index 161547705..39ad3787d 100644
+--- a/README.md
++++ b/README.md
+@@ -619,6 +619,18 @@ loads the extended block and chooses 5 or 7 per round (experimental: it measured
+ slower under concurrency). `--dspark-fixed` verifies every draft. `/v1/stats` exports the fitted costs, prediction error
+ and acceptance under `dspark_policy`. See the [policy design](docs/dspark-bandwidth-policy.md).
+ 
++Copy windows draft from a request's own context, which agent output repeats
++often: file edits, tool arguments that quote code, paths. When a greedy
++request's prompt plus output ends with eight tokens that occurred earlier, the tokens that followed
++the latest earlier occurrence are verified that round in place of dSpark's
++drafts, up to the draft limit, and dSpark skips that request's draft pass.
++Verification is the same exact sample-and-match as for dSpark drafts. A copy
++that accepts nothing pauses copying for that request for two rounds. Sampled
++requests keep dSpark's drafts: their draws leave copied text more often.
++`DS41RT_COPY_DRAFTS=0` disables copy windows, and `/v1/stats` counts them under
++`copy_drafts`. The rule comes from ashhart/TensorFold (MIT), reimplemented from
++its description.
++
+ The coordinator owns attention, mHC residuals, embeddings, mapped Engram lookup, routers, shared experts, vision, all three dSpark stages, the vocabulary head, sampling, cache ownership, and the API. Dual mode splits this work by dependency across the RTX pair, uses TP2 for all shared experts and encoder routed experts, and partitions vocabulary rows for deterministic parallel greedy selection. Four Sparks retain only decoder routed experts in dual mode and all routed experts in single mode.
+ 
+ Compressed global KV uses FP4 E2M1 values with group-16 E4M3 scales. The 128-token sliding windows remain FP8, and the independent selection index uses its own FP4 format. A token radix shares immutable pages, uses copy-on-write for divergent suffixes, and restores retained target/dSpark state. Partial matches replay no more than the final 128 encoder tokens; exact hits can reuse saved first-token logits. The default keeps 20 completed turns and 20 prompt snapshots under LRU eviction.
+diff --git a/docs/dspark-bandwidth-policy.md b/docs/dspark-bandwidth-policy.md
+index e84a51b72..b15e4a4ce 100644
+--- a/docs/dspark-bandwidth-policy.md
++++ b/docs/dspark-bandwidth-policy.md
+@@ -168,12 +168,31 @@ selection takes under 10 µs. Anchor-only rounds are allowed.
+ Grammar-constrained requests are priced like any other; their proposals are
+ first truncated to the grammar.
+ 
++## Copy windows
++
++A greedy request whose history (prompt plus output) ends with eight tokens seen
++earlier verifies the tokens that followed their latest earlier occurrence
++instead of dSpark's drafts, up to the draft limit, and dSpark skips its draft
++pass that round (`copy_drafts.rs`; `DS41RT_COPY_DRAFTS=0` disables). Sampled
++requests never copy: in a mixed soak with a third of requests at temperature
++0.7, copied drafts were accepted 52% of the time, against 95% on greedy
++file rewrites. The policy
++does not choose a copy's length: the whole copy is verified, and the lane's
++other requests are selected as usual. A copy is observed without confidence,
++and its round without a prediction, so calibration, per-request outcomes and
++the time bias learn from dSpark drafts only. Its rows and routes still feed the
++layer and round fits and the request's route history. A draft pass beside a
++copy covered fewer requests than the lane, so that round gives no draft-cost
++sample and its draft time is taken out of the round total.
++
+ ## Monitoring
+ 
+ `/v1/stats` → `dspark_policy` exports the fitted coefficients and implied
+ bandwidth per class and regime, the round fit, prediction error, the draft
+ length histogram, acceptance totals, and per-position confidence reliability
+ (mean predicted versus observed acceptance where a position was reached).
++Its acceptance totals include copy-window rows, which `copy_drafts` counts
++separately.
+ `RUST_LOG=ds41rt::draft_policy=debug` logs each decision and observation.
+ 
+ ## Evaluation against v12
+diff --git a/rust/crates/ds41rt-daemon/src/v41_native_serve.rs b/rust/crates/ds41rt-daemon/src/v41_native_serve.rs
+index cc1e9c8ce..703765d99 100644
+--- a/rust/crates/ds41rt-daemon/src/v41_native_serve.rs
++++ b/rust/crates/ds41rt-daemon/src/v41_native_serve.rs
+@@ -8,6 +8,7 @@ mod distributed;
+ mod placement;
+ pub(crate) mod scores;
+ mod constraints;
++mod copy_drafts;
+ use scores::TokenScores;
+ mod prefix;
+ pub(crate) mod memory;
+diff --git a/rust/crates/ds41rt-daemon/src/v41_native_serve/copy_drafts.rs b/rust/crates/ds41rt-daemon/src/v41_native_serve/copy_drafts.rs
+new file mode 100644
+index 000000000..cc0f49adf
+--- /dev/null
++++ b/rust/crates/ds41rt-daemon/src/v41_native_serve/copy_drafts.rs
+@@ -0,0 +1,385 @@
++//! Copy-window drafts.
++//!
++//! Agent output often repeats its own context: file edits, tool-call arguments
++//! that quote code, paths. When a request's token history (prompt plus emitted
++//! tokens) ends with eight tokens that occurred earlier in that history, the
++//! tokens that followed the most recent earlier occurrence become the round's
++//! drafts in place of dSpark's. The target verifies them exactly as it verifies
++//! dSpark drafts (sample-and-match), so the output is unchanged; only the number
++//! of tokens committed per round differs.
++//!
++//! The rule comes from ashhart/TensorFold (MIT); this is a reimplementation from
++//! its description.
++use anyhow::{ensure, Context, Result};
++use std::collections::HashMap;
++use std::hash::{BuildHasherDefault, Hasher};
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++
++/// Tokens that must match before a copy is proposed. Coincidental shorter
++/// matches (indentation, `self.`) cost more verification than they return.
++pub(super) const WINDOW: usize = 8;
++/// A copy proposal carries at least this many tokens.
++pub(super) const MIN_DRAFTS: usize = 2;
++/// Rounds without copy proposals after a copy round that accepted nothing.
++pub(super) const BACKOFF_ROUNDS: u8 = 2;
++
++/// Copy windows are on unless `DS41RT_COPY_DRAFTS=0`.
++pub(super) fn enabled() -> bool {
++    std::env::var("DS41RT_COPY_DRAFTS").map_or(true, |value| value != "0")
++}
++
++/// Most tokens one copy round may propose, the bound dSpark's proposals obey:
++/// `max_drafts` is the draft limit (at most the loaded draft width), and a round
++/// always emits one token beyond its accepted drafts.
++pub(super) fn cap(remaining: usize, max_drafts: usize) -> usize {
++    remaining.saturating_sub(1).min(max_drafts)
++}
++
++/// One request's copy windows: the absolute end position of the latest
++/// occurrence of each eight-token window of its history, keyed by a 64-bit
++/// hash (16 bytes an entry, no per-token allocation), built on first use and
++/// extended as the history grows; plus the request's backoff.
++#[derive(Default)]
++pub(super) struct CopyDrafter {
++    latest: HashMap<u64, usize, BuildHasherDefault<KeyHasher>>,
++    /// Windows that end before this position are indexed.
++    indexed: usize,
++    /// Rounds left before copies are proposed again.
++    backoff: u8,
++}
++
++impl CopyDrafter {
++    /// This round's copied drafts, or `None`. `history` is the request's whole
++    /// token history, prompt then emitted tokens, ending with the anchor; it
++    /// only grows between calls. Call once per decode round: each call counts
++    /// one backoff round.
++    ///
++    /// The drafts are up to `cap` tokens that followed the most recent earlier
++    /// occurrence of the history's final eight tokens. When that occurrence ends
++    /// fewer than `cap` tokens before the anchor, its continuation runs into
++    /// the tokens being proposed, so copying continues from the same distance:
++    /// what re-matching after each accepted token would propose.
++    pub(super) fn propose(&mut self, history: &[u32], cap: usize) -> Option<Vec<u32>> {
++        if self.backoff > 0 {
++            self.backoff -= 1;
++            return None;
++        }
++        if cap < MIN_DRAFTS || history.len() <= WINDOW {
++            return None;
++        }
++        let end = history.len() - 1;
++        // Index every window that ends before the anchor. The current suffix
++        // stays out until a later round, so a lookup finds only an earlier
++        // occurrence.
++        for last in self.indexed.max(WINDOW - 1)..end {
++            self.latest.insert(key(&history[last + 1 - WINDOW..=last]), last);
++        }
++        self.indexed = self.indexed.max(end);
++        let suffix = &history[end + 1 - WINDOW..];
++        let earlier = *self.latest.get(&key(suffix))?;
++        let distance = end.checked_sub(earlier).filter(|&distance| distance > 0)?;
++        // Distinct windows can share a key: copy only after the tokens match.
++        if history.get(earlier + 1 - WINDOW..=earlier)? != suffix {
++            return None;
++        }
++        Some((0..cap).map(|index| history[earlier + 1 + index % distance]).collect())
++    }
++
++    /// Close a verified copy round in which `accepted` copied tokens matched.
++    pub(super) fn observe(&mut self, accepted: usize) {
++        if accepted == 0 {
++            self.backoff = BACKOFF_ROUNDS;
++        }
++    }
++}
++
++/// A lane round's verify inputs in member order: each member's copy where it
++/// has one, otherwise the drafter's next output. The drafter drafted exactly
++/// the members without a copy, in order.
++pub(super) fn merge(copies: Vec<Option<Vec<u32>>>, drafted: Vec<Vec<u32>>) -> Result<Vec<Vec<u32>>> {
++    let mut drafted = drafted.into_iter();
++    let merged = copies.into_iter().map(|copy| copy.or_else(|| drafted.next()))
++        .collect::<Option<Vec<_>>>().context("fewer draft outputs than drafting requests")?;
++    ensure!(drafted.next().is_none(), "more draft outputs than drafting requests");
++    Ok(merged)
++}
++
++static REQUEST_ROUNDS: AtomicU64 = AtomicU64::new(0);
++static VERIFIED: AtomicU64 = AtomicU64::new(0);
++static ACCEPTED: AtomicU64 = AtomicU64::new(0);
++
++/// Count one request's verified copy round.
++pub(super) fn record_round(verified: usize, accepted: usize) {
++    REQUEST_ROUNDS.fetch_add(1, Relaxed);
++    VERIFIED.fetch_add(verified as u64, Relaxed);
++    ACCEPTED.fetch_add(accepted as u64, Relaxed);
++}
++
++/// Lifetime copy counters for the per-second `stats` payload. The length
++/// policy observes every verified row, so `dspark_policy`'s verified and
++/// accepted drafts include these.
++pub(super) fn stats() -> serde_json::Value {
++    serde_json::json!({
++        "request_rounds": REQUEST_ROUNDS.load(Relaxed),
++        "verified_drafts": VERIFIED.load(Relaxed),
++        "accepted_drafts": ACCEPTED.load(Relaxed),
++    })
++}
++
++/// A window's key: 64 well-mixed bits. Vocabulary ids fit in 32 bits.
++fn key(window: &[u32]) -> u64 {
++    window.chunks_exact(2).fold(0x243F_6A88_85A3_08D3, |hash, pair| {
++        mix(hash ^ (u64::from(pair[0]) | (u64::from(pair[1]) << 32)))
++    })
++}
++
++/// SplitMix64's finalizer: a bijection that spreads every input bit.
++fn mix(mut z: u64) -> u64 {
++    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++    z ^ (z >> 31)
++}
++
++/// Window keys are already mixed, so the index uses them as they are.
++#[derive(Default)]
++struct KeyHasher(u64);
++impl Hasher for KeyHasher {
++    fn finish(&self) -> u64 {
++        self.0
++    }
++    fn write(&mut self, bytes: &[u8]) {
++        for &byte in bytes {
++            self.0 = mix(self.0 ^ u64::from(byte));
++        }
++    }
++    fn write_u64(&mut self, key: u64) {
++        self.0 = key;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Brute force: search backwards for the latest earlier occurrence of the
++    /// final window, then copy one token at a time, each read from the
++    /// history as extended by the tokens already copied.
++    fn reference(history: &[u32], cap: usize) -> Option<Vec<u32>> {
++        if cap < MIN_DRAFTS || history.len() <= WINDOW {
++            return None;
++        }
++        let end = history.len() - 1;
++        let suffix = &history[end + 1 - WINDOW..];
++        let earlier = (WINDOW - 1..end).rev().find(|&last| &history[last + 1 - WINDOW..=last] == suffix)?;
++        let mut extended = history.to_vec();
++        for index in 0..cap {
++            extended.push(extended[earlier + 1 + index]);
++        }
++        Some(extended[end + 1..].to_vec())
++    }
++
++    /// Distinct filler tokens that cannot match anything else in a test.
++    fn filler(from: u32, count: u32) -> Vec<u32> {
++        (from..from + count).collect()
++    }
++
++    #[test]
++    fn copies_what_followed_the_latest_earlier_window() {
++        let window: Vec<u32> = (1..=8).collect();
++        let mut history = filler(1000, 5);
++        history.extend(&window);
++        history.extend([50, 51, 52, 53, 54, 55, 56, 57, 58]);
++        history.extend(filler(2000, 4));
++        history.extend(&window);
++        history.extend([60, 61, 62, 63, 64, 65, 66, 67, 68]);
++        history.extend(filler(3000, 4));
++        history.extend(&window);
++        // Two earlier occurrences: the later one's continuation is copied.
++        assert_eq!(CopyDrafter::default().propose(&history, 5), Some(vec![60, 61, 62, 63, 64]));
++        assert_eq!(CopyDrafter::default().propose(&history, 7), Some(vec![60, 61, 62, 63, 64, 65, 66]));
++        assert_eq!(reference(&history, 7), Some(vec![60, 61, 62, 63, 64, 65, 66]));
++    }
++
++    #[test]
++    fn enters_only_on_eight_matching_tokens() {
++        let mut history = filler(1000, 5);
++        history.extend(1..=8);
++        history.extend([50, 51, 52]);
++        history.extend(filler(2000, 3));
++        // The final seven tokens occurred earlier; the eighth from the end did not.
++        let mut seven = history.clone();
++        seven.push(99);
++        seven.extend(2..=8);
++        assert_eq!(CopyDrafter::default().propose(&seven, 7), None);
++        let mut eight = history;
++        eight.extend(1..=8);
++        assert_eq!(CopyDrafter::default().propose(&eight, 7), Some(vec![50, 51, 52, 2000, 2001, 2002, 1]));
++        // Too short a history to hold an earlier window.
++        assert_eq!(CopyDrafter::default().propose(&[7; 8], 7), None);
++        assert_eq!(CopyDrafter::default().propose(&[7; 9], 7), Some(vec![7; 7]));
++    }
++
++    #[test]
++    fn proposes_two_to_cap_tokens() {
++        let mut history = filler(1000, 3);
++        history.extend(1..=8);
++        history.extend(filler(50, 10));
++        history.extend(1..=8);
++        for cap in 0..MIN_DRAFTS {
++            assert_eq!(CopyDrafter::default().propose(&history, cap), None, "cap {cap}");
++        }
++        for cap in MIN_DRAFTS..=7 {
++            let drafts = CopyDrafter::default().propose(&history, cap).unwrap();
++            assert_eq!(drafts, filler(50, cap as u32), "cap {cap}");
++        }
++    }
++
++    /// A source that ends just before the anchor overlaps the suffix; its
++    /// continuation keeps the source's period instead of stopping at the anchor.
++    #[test]
++    fn overlapping_sources_repeat_their_period() {
++        // A run: the latest earlier window ends one token before the anchor.
++        let mut run = filler(1000, 4);
++        run.extend([5; 12]);
++        assert_eq!(CopyDrafter::default().propose(&run, 7), Some(vec![5; 7]));
++        // Period three: "a b c a b c ..." continues "a b c ..." from the anchor.
++        let mut period = filler(1000, 4);
++        period.extend([1, 2, 3].repeat(4));
++        assert_eq!(period.last(), Some(&3));
++        assert_eq!(CopyDrafter::default().propose(&period, 7), Some(vec![1, 2, 3, 1, 2, 3, 1]));
++        // Period five against a cap of three: nothing wraps.
++        let mut five = filler(1000, 4);
++        five.extend([1, 2, 3, 4, 5].repeat(3));
++        assert_eq!(CopyDrafter::default().propose(&five, 3), Some(vec![1, 2, 3]));
++        for history in [&run, &period, &five] {
++            for cap in 0..=7 {
++                assert_eq!(CopyDrafter::default().propose(history, cap), reference(history, cap));
++            }
++        }
++    }
++
++    /// Positions are absolute and the current suffix never matches itself.
++    #[test]
++    fn a_window_seen_only_at_the_end_has_no_copy() {
++        let mut drafter = CopyDrafter::default();
++        let history = filler(1000, 40);
++        for end in 1..=history.len() {
++            assert_eq!(drafter.propose(&history[..end], 7), None, "prefix {end}");
++        }
++        // The same window again, 40 tokens later, copies from the first.
++        let mut repeated = history.clone();
++        repeated.extend(filler(1000, 8));
++        assert_eq!(drafter.propose(&repeated, 7), Some(filler(1008, 7)));
++    }
++
++    /// A key shared by two different windows must not propose the other
++    /// window's continuation. A 64-bit collision cannot be found on demand, so
++    /// the test plants one.
++    #[test]
++    fn a_hash_collision_is_rejected_by_the_token_check() {
++        let mut history = filler(1000, 30);
++        history.extend(1..=8);
++        let mut drafter = CopyDrafter::default();
++        assert_eq!(drafter.propose(&history, 7), None);
++        let suffix = &history[history.len() - WINDOW..];
++        // Point the suffix's key at a different window that ends earlier.
++        drafter.latest.insert(key(suffix), 20);
++        assert_eq!(drafter.propose(&history, 7), None);
++        // The same entry at a genuine occurrence is used.
++        let mut genuine = filler(1000, 12);
++        genuine.extend(1..=8);
++        genuine.extend(filler(2000, 10));
++        genuine.extend(1..=8);
++        let mut drafter = CopyDrafter::default();
++        assert_eq!(drafter.propose(&genuine, 3), Some(filler(2000, 3)));
++        assert_eq!(drafter.latest.get(&key(&genuine[genuine.len() - WINDOW..])), Some(&19));
++    }
++
++    #[test]
++    fn backs_off_two_rounds_after_a_copy_accepts_nothing() {
++        let mut history = filler(1000, 3);
++        history.extend(1..=8);
++        history.extend(filler(50, 10));
++        history.extend(1..=8);
++        let mut drafter = CopyDrafter::default();
++        assert!(drafter.propose(&history, 7).is_some());
++        drafter.observe(1);
++        assert!(drafter.propose(&history, 7).is_some(), "an accepted copy keeps copying");
++        drafter.observe(0);
++        assert_eq!(drafter.propose(&history, 7), None, "first backoff round");
++        assert_eq!(drafter.propose(&history, 7), None, "second backoff round");
++        assert!(drafter.propose(&history, 7).is_some(), "copying resumes on the third round");
++        // Rounds that could not copy anyway still count toward the backoff.
++        drafter.observe(0);
++        assert_eq!(drafter.propose(&history, 0), None);
++        assert_eq!(drafter.propose(&history, 1), None);
++        assert!(drafter.propose(&history, 7).is_some());
++    }
++
++    #[test]
++    fn the_cap_follows_the_remaining_budget_and_the_draft_limit() {
++        // A round emits one token beyond its accepted drafts.
++        assert_eq!(cap(0, 7), 0);
++        assert_eq!(cap(1, 7), 0);
++        assert_eq!(cap(2, 7), 1);
++        assert_eq!(cap(3, 7), 2);
++        assert_eq!(cap(8, 7), 7);
++        assert_eq!(cap(1000, 7), 7);
++        assert_eq!(cap(1000, 5), 5);
++        // A budget of two leaves one draft: below the minimum, so no copy.
++        let history = [5u32; 20];
++        assert_eq!(CopyDrafter::default().propose(&history, cap(2, 7)), None);
++        assert_eq!(CopyDrafter::default().propose(&history, cap(3, 7)), Some(vec![5, 5]));
++        assert_eq!(CopyDrafter::default().propose(&history, cap(1000, 5)), Some(vec![5; 5]));
++    }
++
++    /// The index built on first use and extended round by round agrees with a
++    /// brute-force search at every length, and holds at most one entry per
++    /// indexed window.
++    #[test]
++    fn the_incremental_index_matches_a_brute_force_search() {
++        // A small alphabet repeats windows often; copied spans add long matches.
++        let mut state = 0x2545_F491_4F6C_DD1Du64;
++        let mut next = |bound: u64| {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            state % bound
++        };
++        let mut history: Vec<u32> = Vec::new();
++        while history.len() < 3000 {
++            if history.len() > 64 && next(8) == 0 {
++                let start = next(history.len() as u64 - 32) as usize;
++                let span = 8 + next(24) as usize;
++                let copied = history[start..start + span].to_vec();
++                history.extend(copied);
++            } else {
++                history.push(next(3) as u32);
++            }
++        }
++        let mut drafter = CopyDrafter::default();
++        let mut proposed = 0;
++        for end in 1..=history.len() {
++            let cap = end % 8;
++            let drafts = drafter.propose(&history[..end], cap);
++            assert_eq!(drafts, reference(&history[..end], cap), "prefix {end} cap {cap}");
++            proposed += usize::from(drafts.is_some());
++            assert!(drafter.latest.len() <= end.saturating_sub(WINDOW));
++        }
++        assert!(proposed > 1000, "the fixture exercises copies ({proposed})");
++        // A drafter that first sees the whole history agrees too.
++        assert_eq!(CopyDrafter::default().propose(&history, 7), reference(&history, 7));
++    }
++
++    #[test]
++    fn merge_keeps_member_order() {
++        let copies = vec![Some(vec![1, 2, 3]), None, Some(vec![4, 5, 6]), None];
++        let drafted = vec![vec![7, 8], vec![9]];
++        assert_eq!(merge(copies.clone(), drafted).unwrap(),
++            vec![vec![1, 2, 3], vec![7, 8], vec![4, 5, 6], vec![9]]);
++        // Without copies the drafter's outputs pass through unchanged.
++        assert_eq!(merge(vec![None, None], vec![vec![1], vec![2, 3]]).unwrap(), vec![vec![1], vec![2, 3]]);
++        assert!(merge(copies.clone(), vec![vec![7]]).is_err());
++        assert!(merge(copies, vec![vec![7], vec![8], vec![9]]).is_err());
++    }
++}
+diff --git a/rust/crates/ds41rt-daemon/src/v41_native_serve/scheduler.rs b/rust/crates/ds41rt-daemon/src/v41_native_serve/scheduler.rs
+index fd0bb6742..bf683892a 100644
+--- a/rust/crates/ds41rt-daemon/src/v41_native_serve/scheduler.rs
++++ b/rust/crates/ds41rt-daemon/src/v41_native_serve/scheduler.rs
+@@ -11,6 +11,7 @@ use crate::v41_backbone_cache::CacheLease;
+ use crate::v41_requests::RequestBatch;
+ use super::prefix::{ImageKeys, PrefixCache, SnapshotKind};
+ use super::console;
++use super::copy_drafts::{self, CopyDrafter};
+ 
+ #[cfg(test)]
+ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary,
+@@ -30,7 +31,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
+         job: NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), max_tokens: 4, sampling: Default::default(), events },
+         decoder: ds41rt_loader::streaming_token_decoder(snapshot, false)?, anchor,
+         generated: 0, buffered: 0, lane: 0, finished: false, cacheable: false, failed: false,
+-        tokens: tokens.to_vec(), image_keys, next_after_commit: None };
++        tokens: tokens.to_vec(), image_keys, next_after_commit: None, copy: None };
+     request.emit(&[anchor])?;
+     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
+     let mut active = [Some(request), None];
+@@ -76,6 +77,8 @@ pub(super) struct Active<'a> {
+     tokens: Vec<u32>,
+     image_keys: ImageKeys,
+     next_after_commit: Option<TokenScores>,
++    /// Copy windows over `tokens`; `None` when copy drafting is off.
++    copy: Option<CopyDrafter>,
+ }
+ impl Active<'_> {
+     /// Why the request left the scheduler, for the live console.
+@@ -193,6 +196,7 @@ fn serving_stats(prefixes: &PrefixCache<'_>) -> serde_json::Value {
+         "host_cache_config": prefixes.host_config(),
+         "target_sampling": sampling_stats::snapshot(),
+         "dspark_policy": super::speculative::policy_snapshot(),
++        "copy_drafts": copy_drafts::stats(),
+         "totals": console::totals::snapshot(),
+     })
+ }
+@@ -213,6 +217,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
+     let mut pending: Option<admission::Pending> = None;
+     let mut stats_published = Instant::now();
+     let limits = ds41rt_api::native_v41::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
++    // Copy windows replace dSpark's drafts for a round, so they need dSpark's verifier.
++    let copy_windows = draft.is_some() && copy_drafts::enabled();
++    tracing::info!(copy_drafts=copy_windows, window=copy_drafts::WINDOW, "copy-window drafting {}",
++        if copy_windows { "on" } else if draft.is_some() { "off (DS41RT_COPY_DRAFTS=0)" } else { "off (needs dSpark)" });
+     loop {
+         prefixes.tick();
+         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
+@@ -379,7 +387,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
+                 // The first generated token is emitted-token index 0.
+                 let anchor = scores.sample(mask, job.sampling, 0)?;
+                 Ok(Active { constraint, id, lease, job, decoder, anchor, generated: 0, buffered: 0, lane,
+-                    finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores) })
++                    finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores),
++                    copy: copy_windows.then(CopyDrafter::default) })
+             })();
+             match result {
+                 Ok(mut request) => {
+@@ -1176,6 +1185,41 @@ fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<
+     requests.prepare(&work)
+ }
+ 
++/// Copy-window verify inputs for one lane round, in member order:
++/// `[anchor, copied...]` for a greedy request whose history ends in eight
++/// tokens it has seen before, else `None` and dSpark drafts it. A sampled
++/// request never copies: its draw leaves copied text more often, and a copy
++/// that fails costs the request dSpark's drafts for that round. A copy takes
++/// the same grammar truncation as dSpark drafts; one cut below two tokens goes
++/// to dSpark.
++fn copy_inputs(active: &mut [Option<Active<'_>>], members: &[usize], max_drafts: usize)
++    -> Result<Vec<Option<Vec<u32>>>> {
++    members.iter().map(|&slot| {
++        let request = active[slot].as_mut().unwrap();
++        if !request.job.sampling.is_greedy() { return Ok(None); }
++        let cap = copy_drafts::cap(request.job.max_tokens - request.generated, max_drafts);
++        let Some(copied) = request.copy.as_mut().and_then(|copy| copy.propose(&request.tokens, cap))
++            else { return Ok(None) };
++        let mut input = Vec::with_capacity(copied.len() + 1);
++        input.push(request.anchor);
++        input.extend(copied);
++        if let Some(constraint) = &request.constraint { constraint.truncate_proposal(&mut input)?; }
++        Ok((input.len() > copy_drafts::MIN_DRAFTS).then_some(input))
++    }).collect()
++}
++
++/// Count each copy the round verified, and back off a request whose copy
++/// accepted nothing.
++fn finish_copies(active: &mut [Option<Active<'_>>], members: &[usize], copied: &[bool],
++    inputs: &[Vec<u32>], accepted: &[u32]) {
++    for (((&slot, &copied), input), &accepted) in members.iter().zip(copied).zip(inputs).zip(accepted) {
++        if !copied { continue; }
++        let drafts = accepted.saturating_sub(1) as usize;
++        copy_drafts::record_round(input.len() - 1, drafts);
++        if let Some(copy) = active[slot].as_mut().and_then(|request| request.copy.as_mut()) { copy.observe(drafts); }
++    }
++}
++
+ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
+     lane: usize, pass: &mut TargetPass<'w, 'a>, requests: &mut Requests<'a>,
+     transport: &mut NativeTp4Wave<'a>, active: &mut [Option<Active<'a>>],
+@@ -1190,19 +1234,30 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
+         Ok((r.id, r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
+     }).collect::<Result<Vec<_>>>()?;
+     let draft_start = Instant::now();
+-    let mut inputs = if let Some(draft) = draft.as_deref_mut() { draft.propose(lib, lane, &seeds)? }
+-        else { seeds.iter().map(|r| vec![r.1]).collect() };
++    // A request that copies from its own history skips this round's dSpark draft.
++    let copies = copy_inputs(active, members, draft.as_deref().map_or(0, |d| d.max_verify_rows() - 1))?;
++    let copied: Vec<bool> = copies.iter().map(Option::is_some).collect();
++    let drafting: Vec<_> = seeds.iter().zip(&copied).filter(|(_, copied)| !**copied).map(|(seed, _)| *seed).collect();
++    if let Some(draft) = draft.as_deref_mut().filter(|_| copied.contains(&true)) {
++        let ids: Vec<_> = seeds.iter().zip(&copied).filter(|(_, copied)| **copied).map(|(seed, _)| seed.0).collect();
++        draft.skip_copied(lane, &ids, !drafting.is_empty())?;
++    }
++    let drafted = if drafting.is_empty() { Vec::new() }
++        else if let Some(draft) = draft.as_deref_mut() { draft.propose(lib, lane, &drafting)? }
++        else { drafting.iter().map(|r| vec![r.1]).collect() };
++    let mut inputs = copy_drafts::merge(copies, drafted)?;
+     let proposal = console::Proposal::capture(&inputs, console::live());
+     for (&slot, input) in members.iter().zip(&mut inputs) {
+         let r = active[slot].as_ref().unwrap();
+         if let Some(constraint) = &r.constraint { constraint.truncate_proposal(input)?; }
+     }
+-    // This path runs only while the other lane is empty.
++    // This path runs only while the other lane is empty. A copy verifies whole.
+     if let Some(draft) = draft.as_deref_mut() {
+-        let candidates: Vec<_> = members.iter().zip(&inputs).map(|(&slot, input)|
+-            (active[slot].as_ref().unwrap().id, input.len()-1)).collect();
++        let candidates: Vec<_> = members.iter().zip(&inputs).zip(&copied).filter(|(_, copied)| !**copied)
++            .map(|((&slot, input), _)| (active[slot].as_ref().unwrap().id, input.len()-1)).collect();
+         if let Some(lengths) = draft.select_lengths(lane, &candidates, false)? {
+-            for (input, length) in inputs.iter_mut().zip(lengths) { input.truncate(length+1); }
++            for (input, length) in inputs.iter_mut().zip(&copied).filter(|(_, copied)| !**copied)
++                .map(|(input, _)| input).zip(lengths) { input.truncate(length+1); }
+         }
+     }
+     let draft_us = draft_start.elapsed().as_micros() as u64;
+@@ -1246,6 +1301,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
+         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
+             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(), 0,
+             Some(&round), retain_enabled)?;
++        finish_copies(active, members, &copied, &inputs, &accepted_inputs);
+         let live = console::live();
+         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
+         for (&slot, tokens) in members.iter().zip(emissions) {
+@@ -1258,7 +1314,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
+         }
+         let layer_us = pass.captured_layer_us();
+         observe_lane_round(draft.as_deref_mut(), capture_routes, lane, false, pass.captured_routes(),
+-            &layer_us, active, members, &inputs, &accepted_inputs, started, draft_us);
++            &layer_us, active, members, &inputs, &accepted_inputs, &copied, started, draft_us);
+         if let Some(live) = live {
+             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, verified_us,
+                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, Some(&round)));
+@@ -1286,6 +1342,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
+         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
+             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(),
+             executed_us-prepared_us, None, retain_enabled)?;
++        finish_copies(active, members, &copied, &inputs, &accepted_inputs);
+         let live = console::live();
+         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
+         for (&slot, tokens) in members.iter().zip(emissions) {
+@@ -1298,7 +1355,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
+         }
+         let layer_us = pass.captured_layer_us();
+         observe_lane_round(draft.as_deref_mut(), capture_routes, lane, false, pass.captured_routes(),
+-            &layer_us, active, members, &inputs, &accepted_inputs, started, draft_us);
++            &layer_us, active, members, &inputs, &accepted_inputs, &copied, started, draft_us);
+         if let Some(live) = live {
+             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, executed_us - prepared_us,
+                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, None));
+@@ -1746,13 +1803,14 @@ pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<
+ 
+ fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_, 'a, C>>, capture_routes: bool,
+     lane: usize, shared: bool, routes: &[Vec<[u32; 6]>], layer_us: &[Option<f64>],
+-    active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>], accepted: &[u32], started: Instant,
+-    draft_us: u64,
++    active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>], accepted: &[u32], copied: &[bool],
++    started: Instant, draft_us: u64,
+ ) {
+     let Some(draft) = draft else { return };
+     if !capture_routes { return; }
+-    let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).filter_map(|((&slot, input), &count)|
+-        active[slot].as_ref().map(|r| (r.id, input.len(), count))).collect();
++    let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).zip(copied)
++        .filter_map(|(((&slot, input), &count), &copied)|
++            active[slot].as_ref().map(|r| (r.id, input.len(), count, copied))).collect();
+     if requests.len() != members.len() { return; }
+     draft.observe_round(lane, shared, routes, layer_us, &requests, started.elapsed().as_micros() as u64, draft_us);
+ }
+diff --git a/rust/crates/ds41rt-daemon/src/v41_native_serve/scheduler/independent.rs b/rust/crates/ds41rt-daemon/src/v41_native_serve/scheduler/independent.rs
+index a233876a5..236b050b4 100644
+--- a/rust/crates/ds41rt-daemon/src/v41_native_serve/scheduler/independent.rs
++++ b/rust/crates/ds41rt-daemon/src/v41_native_serve/scheduler/independent.rs
+@@ -71,17 +71,31 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
+                     Ok((r.id, r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
+                 }).collect::<Result<Vec<_>>>()?
+             };
+-            let (mut inputs, draft_us) = loop {
++            // A request that copies from its own history skips this round's dSpark draft.
++            let copies = {
++                let max_drafts = draft.borrow().as_ref().map_or(0, |d| d.max_verify_rows() - 1);
++                copy_inputs(&mut active.borrow_mut(), &members, max_drafts)?
++            };
++            let copied: Vec<bool> = copies.iter().map(Option::is_some).collect();
++            let drafting: Vec<_> = seeds.iter().zip(&copied).filter(|(_, copied)| !**copied)
++                .map(|(seed, _)| *seed).collect();
++            if let Some(draft) = draft.borrow_mut().as_deref_mut().filter(|_| copied.contains(&true)) {
++                let ids: Vec<_> = seeds.iter().zip(&copied).filter(|(_, copied)| **copied)
++                    .map(|(seed, _)| seed.0).collect();
++                draft.skip_copied(lane, &ids, !drafting.is_empty())?;
++            }
++            let (drafted, draft_us) = if drafting.is_empty() { (Vec::new(), 0) } else { loop {
+                 let proposed = {
+                     let mut draft = draft.borrow_mut();
+-                    if let Some(draft) = draft.as_deref_mut() { draft.poll_propose(lane, &seeds)? }
+-                    else { Some((seeds.iter().map(|r| vec![r.1]).collect(), 0)) }
++                    if let Some(draft) = draft.as_deref_mut() { draft.poll_propose(lane, &drafting)? }
++                    else { Some((drafting.iter().map(|r| vec![r.1]).collect(), 0)) }
+                 };
+                 if let Some(inputs) = proposed { break inputs; }
+                 // Even when a peer requests a cohort drain, finish our pending
+                 // draft and transaction before retirement can recycle its slots.
+                 tokio::task::yield_now().await;
+-            };
++            } };
++            let mut inputs = copy_drafts::merge(copies, drafted)?;
+             let proposal = console::Proposal::capture(&inputs, console::live());
+             let shared = active.borrow().iter().flatten().any(|r| r.lane != lane);
+             let (inputs, mut batch, capture_routes) = {
+@@ -93,12 +107,14 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
+                     if let Some(constraint) = &r.constraint { constraint.truncate_proposal(input)?; }
+                 }
+                 // Lengths are chosen from this lane's proposals and routes only;
+-                // the peer lane's activity selects the shared-regime fit.
++                // the peer lane's activity selects the shared-regime fit. A copy
++                // verifies whole.
+                 if let Some(draft) = draft.as_deref_mut() {
+-                    let candidates: Vec<_> = members.iter().zip(&inputs).map(|(&slot, input)|
+-                        (active[slot].as_ref().unwrap().id, input.len()-1)).collect();
++                    let candidates: Vec<_> = members.iter().zip(&inputs).zip(&copied).filter(|(_, copied)| !**copied)
++                        .map(|((&slot, input), _)| (active[slot].as_ref().unwrap().id, input.len()-1)).collect();
+                     if let Some(lengths) = draft.select_lengths(lane, &candidates, shared)? {
+-                        for (input, length) in inputs.iter_mut().zip(lengths) { input.truncate(length+1); }
++                        for (input, length) in inputs.iter_mut().zip(&copied).filter(|(_, copied)| !**copied)
++                            .map(|(input, _)| input).zip(lengths) { input.truncate(length+1); }
+                     }
+                 }
+                 let batch = prepare_decode_lane(&mut requests, &active, &members, &inputs, draft.is_some())?;
+@@ -208,6 +224,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
+                 }
+                 let (accepted, emitted, emissions, accepted_inputs) = publish_commit_lane(&mut active.borrow_mut(),
+                     &members, &mut batch, decision)?;
++                finish_copies(&mut active.borrow_mut(), &members, &copied, &inputs, &accepted_inputs);
+                 let live = console::live();
+                 let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
+                 tracing::debug!(target: "ds41rt::lane_schedule", lane, round_id,
+@@ -239,7 +256,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
+                 let layer_us = pass.captured_layer_us();
+                 observe_lane_round(draft.borrow_mut().as_deref_mut(), capture_routes, lane, shared,
+                     pass.captured_routes(), &layer_us, &active.borrow(), &members, &inputs,
+-                    &accepted_inputs, started, draft_us);
++                    &accepted_inputs, &copied, started, draft_us);
+                 if let Some(live) = live {
+                     let active = active.borrow();
+                     live.push(console_round(tally, lane, shared, started, draft_us,
+diff --git a/rust/crates/ds41rt-daemon/src/v41_native_serve/speculative.rs b/rust/crates/ds41rt-daemon/src/v41_native_serve/speculative.rs
+index bd0e11582..8b519fb43 100644
+--- a/rust/crates/ds41rt-daemon/src/v41_native_serve/speculative.rs
++++ b/rust/crates/ds41rt-daemon/src/v41_native_serve/speculative.rs
+@@ -166,6 +166,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
+         self.predicted[lane] = None;
+         self.lane_shared[lane] = shared;
+         let width = self.lane_width[lane];
++        // Every request of the round copied: it has no dSpark lengths to choose.
++        if requests.is_empty() { return Ok(None); }
+         let Some(policy) = &mut self.policy else { return Ok(None) };
+         let probabilities = requests.iter().map(|&(id, maximum)| {
+             if maximum == 0 { return Ok(Vec::new()); }
+@@ -196,27 +198,15 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
+         })
+     }
+     /// Feed one completed lane round to the policy. `requests` are (identity,
+-    /// verifier rows, accepted inputs) in lane order; `total_us` spans draft
+-    /// start to commit. Observation problems are logged, never fatal.
++    /// verifier rows, accepted inputs, copied) in lane order; `total_us` spans
++    /// draft start to commit. Observation problems are logged, never fatal.
+     pub fn observe_round(&mut self, lane: usize, shared: bool, routes: &[Vec<[u32; 6]>],
+-        layer_us: &[Option<f64>], requests: &[(u64, usize, u32)], total_us: u64, draft_us: u64) {
++        layer_us: &[Option<f64>], requests: &[(u64, usize, u32, bool)], total_us: u64, draft_us: u64) {
+         let predicted = self.predicted.get_mut(lane).and_then(Option::take);
+         let width = self.lane_width.get(lane).copied().unwrap_or(0);
+         let Some(policy) = &mut self.policy else { return };
+-        // Every drafted position's confidence, verified or not: the policy
+-        // bounds reliability evidence to reached positions itself.
+-        let confidence: Vec<Option<Vec<f64>>> = requests.iter().map(|&(id, _, _)|
+-            self.confidence_trace.get(&id).map(|logits| logits.iter().map(|&x| policy::sigmoid(x)).collect()))
+-            .collect();
+-        let observed: Vec<_> = requests.iter().zip(&confidence).map(|(&(id, rows, accepted), confidence)|
+-            ds41rt_core::DsparkObservedRequest { id, rows, accepted: accepted as usize,
+-                confidence: confidence.as_deref() }).collect();
+-        let layer_us: [Option<f64>; ds41rt_core::DSPARK_LAYERS] =
+-            std::array::from_fn(|layer| layer_us.get(layer).copied().flatten());
+-        if let Err(error) = policy.observe(ds41rt_core::DsparkRoundObservation { shared, requests: &observed,
+-            routes, layer_us: &layer_us, total_us: total_us as f64, predicted_us: predicted,
+-            draft_us: if width > 0 { draft_us as f64 } else { f64::NAN },
+-            wide: width > policy.widths().0 }) {
++        if let Err(error) = policy::observe(policy, &self.confidence_trace, shared, routes, layer_us,
++            requests, total_us, draft_us, width, predicted) {
+             tracing::warn!(error, lane, "dSpark policy round observation skipped");
+         }
+         tracing::debug!(target: "ds41rt::draft_policy", lane, shared, predicted_us=predicted, total_us,
+@@ -452,6 +442,19 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
+         result
+     }
+ 
++    /// Copy-window drafts replace dSpark's for the `copied` requests of this lane
++    /// round, so the chain drafts only the others (no draft pass runs unless
++    /// `drafting`). Their stale confidence is cleared so neither the policy nor
++    /// the logs attribute an earlier dSpark round to this one. Like any request
++    /// that did not draft, their accepted rows still reach every window through
++    /// the batch commit, which reads the target's taps for every batch member.
++    pub fn skip_copied(&mut self, lane: usize, copied: &[u64], drafting: bool) -> Result<()> {
++        ensure!(lane < self.lane_width.len(), "invalid draft lane");
++        for id in copied { self.confidence_trace.remove(id); }
++        if !drafting { self.lane_width[lane] = 0; }
++        Ok(())
++    }
++
+     /// Each lane owns its draft scratch and stream; both can replay concurrently.
+     /// Short RefCell borrows never survive a scheduler yield.
+     pub fn poll_propose(&mut self, lane: usize,
+diff --git a/rust/crates/ds41rt-daemon/src/v41_native_serve/speculative/policy.rs b/rust/crates/ds41rt-daemon/src/v41_native_serve/speculative/policy.rs
+index 9d64a8e00..18319c219 100644
+--- a/rust/crates/ds41rt-daemon/src/v41_native_serve/speculative/policy.rs
++++ b/rust/crates/ds41rt-daemon/src/v41_native_serve/speculative/policy.rs
+@@ -4,7 +4,9 @@
+ //! no device work.
+ use anyhow::{ensure, Result};
+ use crate::v41_experts::coordinator::NativeTp4Wave;
+-use ds41rt_core::{DsparkLayerClass, DsparkPlacement, DsparkPolicy, DSPARK_LAYERS};
++use ds41rt_core::{DsparkLayerClass, DsparkObservedRequest, DsparkPlacement, DsparkPolicy,
++    DsparkRoundObservation, DSPARK_LAYERS};
++use std::collections::BTreeMap;
+ use std::sync::Mutex;
+ 
+ const HIDDEN: f64 = 5120.;
+@@ -39,6 +41,42 @@ pub(super) fn sigmoid(x: f32) -> f64 {
+     if x >= 0. { 1. / (1. + (-x).exp()) } else { x.exp() / (1. + x.exp()) }
+ }
+ 
++/// Feed one completed lane round to the policy. `requests` are (identity,
++/// verifier rows, accepted inputs, copied) in lane order, and `width` is the
++/// round's dSpark draft width (zero when no draft pass ran).
++///
++/// A copied request's drafts came from its own history, not the drafter, so it
++/// is observed without confidence: its rows still teach the cost fits and its
++/// route history, never the drafter's calibration or acceptance evidence. A
++/// round with a copy is not a shape the policy selected, so it keeps no
++/// prediction. A draft pass beside a copy covered only the other requests, so
++/// it gives no draft-cost sample, and its time is taken out of the round total
++/// so the round fit's residual stays exact.
++#[allow(clippy::too_many_arguments)]
++pub(super) fn observe(policy: &mut DsparkPolicy, confidence_trace: &BTreeMap<u64, Vec<f32>>, shared: bool,
++    routes: &[Vec<[u32; 6]>], layer_us: &[Option<f64>], requests: &[(u64, usize, u32, bool)],
++    total_us: u64, draft_us: u64, width: usize, predicted: Option<f64>) -> Result<(), &'static str> {
++    // Every drafted position's confidence, verified or not: the policy
++    // bounds reliability evidence to reached positions itself.
++    let confidence: Vec<Option<Vec<f64>>> = requests.iter().map(|&(id, _, _, copied)| if copied { None }
++        else { confidence_trace.get(&id).map(|logits| logits.iter().map(|&x| sigmoid(x)).collect()) })
++        .collect();
++    let observed: Vec<_> = requests.iter().zip(&confidence).map(|(&(id, rows, accepted, _), confidence)|
++        DsparkObservedRequest { id, rows, accepted: accepted as usize,
++            confidence: confidence.as_deref() }).collect();
++    let layer_us: [Option<f64>; DSPARK_LAYERS] =
++        std::array::from_fn(|layer| layer_us.get(layer).copied().flatten());
++    let copied = requests.iter().any(|request| request.3);
++    let (total_us, draft_us) = match (width > 0, copied) {
++        (true, false) => (total_us as f64, draft_us as f64),
++        (true, true) => (total_us.saturating_sub(draft_us) as f64, f64::NAN),
++        (false, _) => (total_us as f64, f64::NAN),
++    };
++    policy.observe(DsparkRoundObservation { shared, requests: &observed,
++        routes, layer_us: &layer_us, total_us, predicted_us: if copied { None } else { predicted },
++        draft_us, wide: width > policy.widths().0 })
++}
++
+ static SNAPSHOT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+ 
+ /// The latest published policy state for the serving `stats` payload.
+@@ -114,6 +152,91 @@ pub(super) fn publish(policy: &DsparkPolicy, draft_limit: usize) {
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::*;
++
++    fn placement() -> DsparkPlacement {
++        DsparkPlacement::new([DsparkLayerClass::Remote; DSPARK_LAYERS], [4_700_160.; DSPARK_LAYERS]).unwrap()
++    }
++    fn routes(rows: usize) -> Vec<Vec<[u32; 6]>> {
++        (0..DSPARK_LAYERS).map(|layer| (0..rows).map(|row|
++            std::array::from_fn(|slot| ((layer * 7 + row * 6 + slot) % 384) as u32)).collect()).collect()
++    }
++    /// Request 1 drafted this round; request 2's trace is left from an earlier
++    /// dSpark round.
++    fn trace() -> BTreeMap<u64, Vec<f32>> {
++        [(1, vec![2.0; 5]), (2, vec![-4.0; 5])].into()
++    }
++
++    /// Without copies the observation is exactly the one built before copy
++    /// windows existed: the policy ends in the same state.
++    #[test]
++    fn rounds_without_copies_observe_as_before() {
++        let layer_us = vec![Some(150.0); DSPARK_LAYERS];
++        let requests = [(1u64, 5usize, 3u32, false), (2, 8, 1, false)];
++        for (width, predicted) in [(5, Some(18_000.)), (7, None), (0, Some(9_000.))] {
++            let confidence: Vec<Option<Vec<f64>>> = requests.iter().map(|&(id, ..)|
++                trace().get(&id).map(|logits| logits.iter().map(|&x| sigmoid(x)).collect())).collect();
++            let observed: Vec<_> = requests.iter().zip(&confidence).map(|(&(id, rows, accepted, _), confidence)|
++                DsparkObservedRequest { id, rows, accepted: accepted as usize, confidence: confidence.as_deref() })
++                .collect();
++            let mut before = DsparkPolicy::new(placement(), false);
++            before.observe(DsparkRoundObservation { shared: false, requests: &observed, routes: &routes(13),
++                layer_us: &std::array::from_fn(|layer| layer_us[layer]), total_us: 20_000., predicted_us: predicted,
++                draft_us: if width > 0 { 1_500. } else { f64::NAN }, wide: width > 5 }).unwrap();
++            let mut after = DsparkPolicy::new(placement(), false);
++            observe(&mut after, &trace(), false, &routes(13), &layer_us, &requests, 20_000, 1_500, width, predicted)
++                .unwrap();
++            assert_eq!(format!("{before:?}"), format!("{after:?}"), "width {width}");
++        }
++    }
++
++    /// A copied request is verified like any other but drafted by nobody: its
++    /// rows teach the cost fits, never the drafter's calibration or acceptance
++    /// evidence, the draft-cost fit or the time bias, even with a stale trace.
++    #[test]
++    fn copy_rounds_teach_costs_but_never_the_drafters_evidence() {
++        let layer_us = vec![Some(150.0); DSPARK_LAYERS];
++        // Request 1 verified four drafts and accepted two; request 2 verified
++        // seven and accepted none.
++        let round = |copied| [(1u64, 5usize, 3u32, false), (2, 8, 1, copied)];
++        let observe_round = |requests: &[(u64, usize, u32, bool)], width, predicted| {
++            let mut policy = DsparkPolicy::new(placement(), false);
++            let rows = requests.iter().map(|r| r.1).sum();
++            observe(&mut policy, &trace(), false, &routes(rows), &layer_us, requests, 20_000, 1_500, width, predicted)
++                .unwrap();
++            policy
++        };
++        let control = observe_round(&round(false), 5, Some(18_000.));
++        let copy = observe_round(&round(true), 5, Some(18_000.));
++        let solo = observe_round(&round(false)[..1], 5, Some(18_000.));
++        // Sensitivity: the drafted request 2 adds evidence at position one.
++        assert_eq!(control.stats().position_reached[..3], [2, 1, 1]);
++        // The copied request adds none: exactly request 1's evidence alone.
++        assert_eq!(copy.stats().position_reached, solo.stats().position_reached);
++        assert_eq!(copy.stats().position_accepted, solo.stats().position_accepted);
++        assert_eq!(copy.calibration(), solo.calibration());
++        assert_ne!(control.calibration(), solo.calibration());
++        // No prediction and no time bias from a shape the policy did not select.
++        assert_eq!((control.stats().predicted_rounds, copy.stats().predicted_rounds), (1, 0));
++        assert_ne!(control.time_bias(), [0.; 2]);
++        assert_eq!(copy.time_bias(), [0.; 2]);
++        // The draft pass beside a copy covered one request of two: no draft sample.
++        assert_eq!((control.cost_snapshot(false).draft[4], copy.cost_snapshot(false).draft[4]), (1., 0.));
++        assert_eq!(copy.stats().width_rounds, [0, 0]);
++        // The copy's rows still teach the layer and round fits, and taking the
++        // draft time out of the total leaves the round residual exact.
++        assert_eq!(copy.cost_snapshot(false).layers, control.cost_snapshot(false).layers);
++        assert_eq!(copy.cost_snapshot(false).round, control.cost_snapshot(false).round);
++        assert_eq!((copy.stats().rounds, copy.stats().verified_rows, copy.stats().verified_drafts), (1, 13, 11));
++
++        // A round in which every request copied ran no draft pass at all.
++        let copies = observe_round(&[(2, 8, 4, true)], 0, None);
++        let undrafted = observe_round(&[(3, 8, 4, false)], 0, None);
++        assert_eq!(copies.stats().position_reached, [0; 7]);
++        assert_eq!(copies.cost_snapshot(false).draft[4], 0.);
++        assert_eq!(copies.cost_snapshot(false).round, undrafted.cost_snapshot(false).round);
++    }
++
+     #[test]
+     fn official_spark_tp4_slice_matches_the_packed_geometry() {
+         // 3 x (1,474,560 FP4 bytes + 92,160 UE8M0 scale bytes).
+-- 
+2.43.0
+
